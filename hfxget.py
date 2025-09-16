@@ -342,7 +342,7 @@ class XgetHFDownloader:
         
         if url_type == "hf-mirror":
             try:
-                self.hf_api.hf_hub_download(**url, local_dir=local_dir)
+                self.hf_api.hf_hub_download(**url, local_dir=local_dir, resume_download=True)
                 return True
             except Exception as e:
                 print(f"下载失败: {local_path.name}")
