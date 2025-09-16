@@ -208,25 +208,15 @@ class XgetHFDownloader:
         try:
             print(f"正在获取 {repo_type} {repo_id} 的文件列表...")
 
-            if repo_type == "model":
-                repo_info = self.hf_api.repo_info(repo_id, revision=revision)
-            elif repo_type == "dataset":
-                repo_info = self.hf_api.repo_info(
-                    repo_id, repo_type="dataset", revision=revision
-                )
-            elif repo_type == "space":
-                repo_info = self.hf_api.repo_info(
-                    repo_id, repo_type="space", revision=revision
-                )
-            else:
-                raise ValueError(f"不支持的仓库类型: {repo_type}")
+            repo_info = self.hf_api.repo_info(repo_id, repo_type=repo_type, revision=revision, files_metadata=True)
 
             files_info = []
             for sibling in repo_info.siblings:
                 file_info = {
                     "filename": sibling.rfilename,
-                    "size": getattr(sibling, "size", None),
-                    "lfs": getattr(sibling, "lfs", None),
+                    "size": sibling.size,
+                    "lfs": sibling.lfs,
+                    "blob_id": sibling.blob_id,
                 }
                 files_info.append(file_info)
 
@@ -239,6 +229,7 @@ class XgetHFDownloader:
     def is_lfs_file(self, file_info):
         """判断文件是否为 LFS 文件"""
         # 如果 API 直接标记了 LFS
+        print(file_info)
         if file_info.get("lfs"):
             return True
 
