@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Xget Hugging Face 下载加速器（无Git依赖版本）
-用于替代 huggingface-cli download 命令，通过 Xget 加速下载
+Xget Hugging Face 下载加速器
+用于替代 hf download 命令，通过 Xget 加速下载，避免网络问题
 
 策略：
 1. 使用 HF API 获取完整文件列表
@@ -348,7 +348,7 @@ class XgetHFDownloader:
         """下载文件并验证完整性"""
         print(f"正在下载: {local_path.name} (使用 {url_type})")
 
-        success = self.downloader.download_file(url, local_path, resume=False)
+        success = self.downloader.download_file(url, local_path, resume=True)
 
         if not success:
             print(f"下载失败: {local_path.name}")
