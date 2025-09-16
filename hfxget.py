@@ -295,15 +295,7 @@ class XgetHFDownloader:
             url_type = "Xget"
         else:
             # 普通文件使用 hf-mirror
-            if repo_type == "dataset":
-                download_url = f"{self.hf_mirror_url}/datasets/{repo_id}/resolve/{revision}/{url_filename}"
-            elif repo_type == "space":
-                download_url = f"{self.hf_mirror_url}/spaces/{repo_id}/resolve/{revision}/{url_filename}"
-            else:  # model
-                download_url = (
-                    f"{self.hf_mirror_url}/{repo_id}/resolve/{revision}/{url_filename}"
-                )
-
+            download_url = {"repo_id": repo_id, "filename": filename, "revision": revision, "repo_type": repo_type}
             url_type = "hf-mirror"
 
         return download_url, url_type
@@ -344,9 +336,17 @@ class XgetHFDownloader:
 
         return True
 
-    def download_and_verify_file(self, url, local_path, file_info, url_type):
+    def download_and_verify_file(self, url, local_dir, local_path, file_info, url_type):
         """下载文件并验证完整性"""
         print(f"正在下载: {local_path.name} (使用 {url_type})")
+        
+        if url_type == "hf-mirror":
+            try:
+                self.hf_api.hf_hub_download(**url, local_dir=local_dir)
+                return True
+            except Exception as e:
+                print(f"下载失败: {local_path.name}")
+                return False
 
         success = self.downloader.download_file(url, local_path, resume=True)
 
@@ -486,7 +486,7 @@ class XgetHFDownloader:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_task = {
                 executor.submit(
-                    self.download_and_verify_file, url, local_path, file_info, url_type
+                    self.download_and_verify_file, url, local_dir, local_path, file_info, url_type
                 ): (url, local_path, file_info, url_type)
                 for url, local_path, file_info, url_type in files_to_download
             }
