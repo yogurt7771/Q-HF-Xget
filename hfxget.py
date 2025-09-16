@@ -242,37 +242,6 @@ class XgetHFDownloader:
         if file_info.get("lfs"):
             return True
 
-        # 如果文件大小超过阈值
-        file_size = file_info.get("size")
-        if file_size and file_size > self.lfs_size_threshold:
-            return True
-
-        # 根据文件扩展名判断
-        filename = file_info["filename"]
-        lfs_extensions = {
-            ".bin",
-            ".safetensors",
-            ".ckpt",
-            ".pth",
-            ".pt",
-            ".h5",
-            ".onnx",
-            ".pb",
-            ".tflite",
-            ".msgpack",
-            ".arrow",
-            ".parquet",
-            ".tar.gz",
-            ".tar.bz2",
-            ".zip",
-            ".7z",
-            ".model",
-        }
-
-        file_path = Path(filename)
-        if file_path.suffix.lower() in lfs_extensions:
-            return True
-
         return False
 
     def build_download_url(
