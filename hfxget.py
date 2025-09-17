@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import sys
 import time
+import traceback
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -255,10 +256,11 @@ class XgetHFDownloader:
             url_type = "Xget"
         else:
             # 普通文件使用 hf-mirror
-            download_url = {"repo_id": repo_id, "filename": filename, "revision": revision, "repo_type": repo_type}
+            download_url = None
             url_type = "hf-mirror"
+        hf_mirror_param = {"repo_id": repo_id, "filename": filename, "revision": revision, "repo_type": repo_type}
 
-        return download_url, url_type
+        return download_url, url_type, hf_mirror_param
 
     def verify_file_integrity(
         self, file_path, expected_size=None, expected_sha256=None
@@ -296,40 +298,41 @@ class XgetHFDownloader:
 
         return True
 
-    def download_and_verify_file(self, url, local_dir, local_path, file_info, url_type):
+    def download_and_verify_file(self, url, local_dir, local_path, file_info, url_type, hf_mirror_param):
         """下载文件并验证完整性"""
         print(f"正在下载: {local_path.name} (使用 {url_type})")
-        
-        if url_type == "hf-mirror":
+
+        if url_type == "Xget":
             try:
-                self.hf_api.hf_hub_download(**url, local_dir=local_dir, resume_download=True)
-                return True
+                success = self.downloader.download_file(url, local_path, resume=True)
+                if not success:
+                    print(f"Xget 下载失败: {local_path.name}")
             except Exception as e:
-                print(f"下载失败: {local_path.name}")
-                return False
+                print(f"Xget 下载失败: {local_path.name}，{e}\n{traceback.format_exc()}")
+                success = False
+            if success:
+                # 验证文件完整性
+                expected_size = file_info.get("size")
+                if expected_size and local_path.exists():
+                    if not self.verify_file_integrity(local_path, expected_size):
+                        print(f"下载完成但验证失败，删除文件: {local_path.name}")
+                        try:
+                            local_path.unlink()
+                        except OSError:
+                            pass
+                        return False
 
-        success = self.downloader.download_file(url, local_path, resume=True)
-
-        if not success:
-            print(f"下载失败: {local_path.name}")
+                size_mb = (
+                    (local_path.stat().st_size / (1024 * 1024)) if local_path.exists() else 0
+                )
+                print(f"✓ 下载成功: {local_path.name} ({size_mb:.1f} MB)")
+                return True
+        try:
+            self.hf_api.hf_hub_download(**hf_mirror_param, local_dir=local_dir, resume_download=True)
+            return True
+        except Exception as e:
+            print(f"下载失败: {local_path.name}，{e}\n{traceback.format_exc()}")
             return False
-
-        # 验证文件完整性
-        expected_size = file_info.get("size")
-        if expected_size and local_path.exists():
-            if not self.verify_file_integrity(local_path, expected_size):
-                print(f"下载完成但验证失败，删除文件: {local_path.name}")
-                try:
-                    local_path.unlink()
-                except OSError:
-                    pass
-                return False
-
-        size_mb = (
-            (local_path.stat().st_size / (1024 * 1024)) if local_path.exists() else 0
-        )
-        print(f"✓ 下载成功: {local_path.name} ({size_mb:.1f} MB)")
-        return True
 
     def download_repo(
         self,
@@ -420,11 +423,11 @@ class XgetHFDownloader:
                     reason = "文件不完整或大小不匹配"
 
             if needs_download:
-                url, url_type = self.build_download_url(
+                url, url_type, hf_mirror_param = self.build_download_url(
                     repo_id, filename, repo_type, revision, is_lfs
                 )
                 print(f"→ 需要下载: {filename} ({reason}) - 使用 {url_type}")
-                files_to_download.append((url, local_path, file_info, url_type))
+                files_to_download.append((url, local_path, file_info, url_type, hf_mirror_param))
 
         print(f"\n需要下载: {len(files_to_download)} 个文件")
         print(f"已完整: {files_already_complete} 个文件")
@@ -446,9 +449,9 @@ class XgetHFDownloader:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_task = {
                 executor.submit(
-                    self.download_and_verify_file, url, local_dir, local_path, file_info, url_type
-                ): (url, local_path, file_info, url_type)
-                for url, local_path, file_info, url_type in files_to_download
+                    self.download_and_verify_file, url, local_dir, local_path, file_info, url_type, hf_mirror_param
+                ): (url, local_path, file_info, url_type, hf_mirror_param)
+                for url, local_path, file_info, url_type, hf_mirror_param in files_to_download
             }
 
             with tqdm(
