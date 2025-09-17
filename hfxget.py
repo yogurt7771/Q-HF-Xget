@@ -12,6 +12,7 @@ Xget Hugging Face 下载加速器
 
 import argparse
 import hashlib
+import signal
 import sys
 import time
 import traceback
@@ -31,6 +32,21 @@ except ImportError:
 
 from huggingface_hub import HfApi
 from tqdm import tqdm
+
+# 全局变量用于跟踪中断状态
+interrupted = False
+
+
+def signal_handler(signum, frame):
+    """处理Ctrl+C中断信号"""
+    global interrupted
+    interrupted = True
+    print("\n\n⚠️  检测到中断信号 (Ctrl+C)，正在停止下载...")
+    print("请等待当前下载任务完成...")
+
+
+# 注册信号处理器
+signal.signal(signal.SIGINT, signal_handler)
 
 
 class DownloaderInterface(ABC):
@@ -148,6 +164,10 @@ class RequestsDownloader(DownloaderInterface):
                         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
                     ) as pbar:
                         for chunk in response.iter_content(chunk_size=65536):
+                            # 检查是否被中断
+                            if interrupted:
+                                print(f"\n⚠️  下载被中断: {local_path.name}")
+                                return False
                             if chunk:
                                 f.write(chunk)
                                 pbar.update(len(chunk))
@@ -160,7 +180,11 @@ class RequestsDownloader(DownloaderInterface):
 
             except Exception as e:
                 # 检查是否是401错误，如果是则不重试
-                if hasattr(e, 'response') and e.response is not None and e.response.status_code == 401:
+                if (
+                    hasattr(e, "response")
+                    and e.response is not None
+                    and e.response.status_code == 401
+                ):
                     print(f"401未授权错误，停止重试: {local_path.name}")
                     print(f"错误: {str(e)}")
                     if resume and temp_path.exists() and temp_path != local_path:
@@ -169,7 +193,7 @@ class RequestsDownloader(DownloaderInterface):
                         except OSError:
                             pass
                     return False
-                
+
                 if attempt < max_retries:
                     print(
                         f"下载失败 (尝试 {attempt + 1}/{max_retries + 1}): {local_path.name}"
@@ -213,14 +237,14 @@ class XgetHFDownloader:
         print(f"HF 镜像: {self.hf_mirror_url}")
         print(f"Xget 加速: {self.xget_base_url}")
 
-    def get_repo_file_list(
-        self, repo_id, repo_type="model", revision="main"
-    ):
+    def get_repo_file_list(self, repo_id, repo_type="model", revision="main"):
         """获取仓库文件列表和详细信息"""
         try:
             print(f"正在获取 {repo_type} {repo_id} 的文件列表...")
 
-            repo_info = self.hf_api.repo_info(repo_id, repo_type=repo_type, revision=revision, files_metadata=True)
+            repo_info = self.hf_api.repo_info(
+                repo_id, repo_type=repo_type, revision=revision, files_metadata=True
+            )
 
             files_info = []
             for sibling in repo_info.siblings:
@@ -236,7 +260,11 @@ class XgetHFDownloader:
 
         except Exception as e:
             # 检查是否是401错误，如果是则不重试
-            if hasattr(e, 'response') and e.response is not None and e.response.status_code == 401:
+            if (
+                hasattr(e, "response")
+                and e.response is not None
+                and e.response.status_code == 401
+            ):
                 print(f"401未授权错误，无法访问仓库: {repo_id}")
                 print(f"错误: {str(e)}")
                 return []
@@ -274,7 +302,12 @@ class XgetHFDownloader:
             # 普通文件使用 hf-mirror
             download_url = None
             url_type = "hf-mirror"
-        hf_mirror_param = {"repo_id": repo_id, "filename": filename, "revision": revision, "repo_type": repo_type}
+        hf_mirror_param = {
+            "repo_id": repo_id,
+            "filename": filename,
+            "revision": revision,
+            "repo_type": repo_type,
+        }
 
         return download_url, url_type, hf_mirror_param
 
@@ -314,8 +347,15 @@ class XgetHFDownloader:
 
         return True
 
-    def download_and_verify_file(self, url, local_dir, local_path, file_info, url_type, hf_mirror_param):
+    def download_and_verify_file(
+        self, url, local_dir, local_path, file_info, url_type, hf_mirror_param
+    ):
         """下载文件并验证完整性"""
+        # 检查是否被中断
+        if interrupted:
+            print(f"⚠️  下载被中断，跳过: {local_path.name}")
+            return False
+
         print(f"正在下载: {local_path.name} (使用 {url_type})")
 
         if url_type == "Xget":
@@ -324,7 +364,9 @@ class XgetHFDownloader:
                 if not success:
                     print(f"Xget 下载失败: {local_path.name}")
             except Exception as e:
-                print(f"Xget 下载失败: {local_path.name}，{e}\n{traceback.format_exc()}")
+                print(
+                    f"Xget 下载失败: {local_path.name}，{e}\n{traceback.format_exc()}"
+                )
                 success = False
             if success:
                 # 验证文件完整性
@@ -339,16 +381,24 @@ class XgetHFDownloader:
                         return False
 
                 size_mb = (
-                    (local_path.stat().st_size / (1024 * 1024)) if local_path.exists() else 0
+                    (local_path.stat().st_size / (1024 * 1024))
+                    if local_path.exists()
+                    else 0
                 )
                 print(f"✓ 下载成功: {local_path.name} ({size_mb:.1f} MB)")
                 return True
         try:
-            self.hf_api.hf_hub_download(**hf_mirror_param, local_dir=local_dir, resume_download=True)
+            self.hf_api.hf_hub_download(
+                **hf_mirror_param, local_dir=local_dir, resume_download=True
+            )
             return True
         except Exception as e:
             # 检查是否是401错误，如果是则不重试
-            if hasattr(e, 'response') and e.response is not None and e.response.status_code == 401:
+            if (
+                hasattr(e, "response")
+                and e.response is not None
+                and e.response.status_code == 401
+            ):
                 print(f"401未授权错误，停止下载: {local_path.name}")
                 print(f"错误: {str(e)}")
                 return False
@@ -448,7 +498,9 @@ class XgetHFDownloader:
                     repo_id, filename, repo_type, revision, is_lfs
                 )
                 print(f"→ 需要下载: {filename} ({reason}) - 使用 {url_type}")
-                files_to_download.append((url, local_path, file_info, url_type, hf_mirror_param))
+                files_to_download.append(
+                    (url, local_path, file_info, url_type, hf_mirror_param)
+                )
 
         print(f"\n需要下载: {len(files_to_download)} 个文件")
         print(f"已完整: {files_already_complete} 个文件")
@@ -470,7 +522,13 @@ class XgetHFDownloader:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_task = {
                 executor.submit(
-                    self.download_and_verify_file, url, local_dir, local_path, file_info, url_type, hf_mirror_param
+                    self.download_and_verify_file,
+                    url,
+                    local_dir,
+                    local_path,
+                    file_info,
+                    url_type,
+                    hf_mirror_param,
                 ): (url, local_path, file_info, url_type, hf_mirror_param)
                 for url, local_path, file_info, url_type, hf_mirror_param in files_to_download
             }
@@ -482,6 +540,14 @@ class XgetHFDownloader:
                 position=0,
             ) as main_pbar:
                 for future in as_completed(future_to_task):
+                    # 检查是否被中断
+                    if interrupted:
+                        print(f"\n⚠️  检测到中断信号，正在取消剩余下载任务...")
+                        # 取消所有未完成的任务
+                        for f in future_to_task:
+                            f.cancel()
+                        break
+
                     url, local_path, file_info, url_type = future_to_task[future]
                     try:
                         success = future.result()
@@ -614,6 +680,12 @@ def main():
             include_patterns=args.include,
             exclude_patterns=args.exclude,
         )
+
+        # 检查是否被中断
+        if interrupted:
+            print(f"\n⚠️  下载被用户中断 (Ctrl+C)")
+            print("已下载的文件将保留在本地目录中")
+            return 130  # 标准的中断退出码
 
         return 0 if success else 1
 
