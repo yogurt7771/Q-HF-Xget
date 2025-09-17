@@ -159,6 +159,17 @@ class RequestsDownloader(DownloaderInterface):
                 return True
 
             except Exception as e:
+                # 检查是否是401错误，如果是则不重试
+                if hasattr(e, 'response') and e.response is not None and e.response.status_code == 401:
+                    print(f"401未授权错误，停止重试: {local_path.name}")
+                    print(f"错误: {str(e)}")
+                    if resume and temp_path.exists() and temp_path != local_path:
+                        try:
+                            temp_path.unlink()
+                        except OSError:
+                            pass
+                    return False
+                
                 if attempt < max_retries:
                     print(
                         f"下载失败 (尝试 {attempt + 1}/{max_retries + 1}): {local_path.name}"
@@ -224,6 +235,11 @@ class XgetHFDownloader:
             return files_info
 
         except Exception as e:
+            # 检查是否是401错误，如果是则不重试
+            if hasattr(e, 'response') and e.response is not None and e.response.status_code == 401:
+                print(f"401未授权错误，无法访问仓库: {repo_id}")
+                print(f"错误: {str(e)}")
+                return []
             print(f"获取文件列表失败: {e}")
             return []
 
@@ -331,6 +347,11 @@ class XgetHFDownloader:
             self.hf_api.hf_hub_download(**hf_mirror_param, local_dir=local_dir, resume_download=True)
             return True
         except Exception as e:
+            # 检查是否是401错误，如果是则不重试
+            if hasattr(e, 'response') and e.response is not None and e.response.status_code == 401:
+                print(f"401未授权错误，停止下载: {local_path.name}")
+                print(f"错误: {str(e)}")
+                return False
             print(f"下载失败: {local_path.name}，{e}\n{traceback.format_exc()}")
             return False
 
