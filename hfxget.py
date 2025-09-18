@@ -183,9 +183,9 @@ class RequestsDownloader(DownloaderInterface):
                 if (
                     hasattr(e, "response")
                     and e.response is not None
-                    and e.response.status_code == 401
+                    and e.response.status_code in [401, 403, 404]
                 ):
-                    print(f"401未授权错误，停止重试: {local_path.name}")
+                    print(f"{e.response.status_code}错误，停止重试: {local_path.name}")
                     print(f"错误: {str(e)}")
                     if resume and temp_path.exists() and temp_path != local_path:
                         try:
@@ -326,9 +326,9 @@ class XgetHFDownloader:
                     f"文件大小不匹配 {file_path.name}: 期望 {expected_size}, 实际 {actual_size}"
                 )
                 return False
-
+            print(f"文件大小匹配 {file_path.name}: 期望 {expected_size}, 实际 {actual_size}")
         # 对小文件验证 SHA256（如果提供了哈希值）
-        if expected_sha256 and expected_size:
+        if expected_sha256:
             try:
                 sha256_hash = hashlib.sha256()
                 with open(file_path, "rb") as f:
@@ -341,10 +341,11 @@ class XgetHFDownloader:
                         f"SHA256不匹配 {file_path.name}: 期望 {expected_sha256}, 实际 {actual_sha256}"
                     )
                     return False
+                print(f"SHA256匹配 {file_path.name}: 期望 {expected_sha256}, 实际 {actual_sha256}")
             except Exception as e:
                 print(f"SHA256验证失败 {file_path.name}: {e}")
                 return False
-
+        print(f"文件完整性验证成功 {file_path.name}")
         return True
 
     def download_and_verify_file(
@@ -371,8 +372,9 @@ class XgetHFDownloader:
             if success:
                 # 验证文件完整性
                 expected_size = file_info.get("size")
+                expected_sha256 = file_info.get("lfs").sha256
                 if expected_size and local_path.exists():
-                    if not self.verify_file_integrity(local_path, expected_size):
+                    if not self.verify_file_integrity(local_path, expected_size, expected_sha256):
                         print(f"下载完成但验证失败，删除文件: {local_path.name}")
                         try:
                             local_path.unlink()
@@ -385,25 +387,27 @@ class XgetHFDownloader:
                     if local_path.exists()
                     else 0
                 )
-                print(f"✓ 下载成功: {local_path.name} ({size_mb:.1f} MB)")
+                print(f"✓ 下载成功: {local_path.name} ({size_mb:.3f} MB)")
                 return True
-        try:
-            self.hf_api.hf_hub_download(
-                **hf_mirror_param, local_dir=local_dir, resume_download=True
-            )
-            return True
-        except Exception as e:
-            # 检查是否是401错误，如果是则不重试
-            if (
-                hasattr(e, "response")
-                and e.response is not None
-                and e.response.status_code == 401
-            ):
-                print(f"401未授权错误，停止下载: {local_path.name}")
-                print(f"错误: {str(e)}")
-                return False
-            print(f"下载失败: {local_path.name}，{e}\n{traceback.format_exc()}")
-            return False
+        for retry in range(4):
+            try:
+                self.hf_api.hf_hub_download(
+                    **hf_mirror_param, local_dir=local_dir, resume_download=True
+                )
+                return True
+            except Exception as e:
+                # 检查是否是401错误，如果是则不重试
+                if (
+                    hasattr(e, "response")
+                    and e.response is not None
+                    and e.response.status_code in [401, 403, 404]
+                ):
+                    print(f"{e.response.status_code}错误，停止下载: {local_path.name}")
+                    print(f"错误: {str(e)}")
+                    return False
+                print(f"{retry}/{4}次下载失败: {local_path.name}，{e}\n{traceback.format_exc()}")
+                time.sleep(2)
+        return False
 
     def download_repo(
         self,
@@ -481,8 +485,12 @@ class XgetHFDownloader:
             else:
                 # 检查文件完整性
                 expected_size = file_info.get("size")
+                if is_lfs:
+                    expected_sha256 = file_info.get("lfs").sha256
+                else:
+                    expected_sha256 = None
                 if expected_size and self.verify_file_integrity(
-                    local_path, expected_size
+                    local_path, expected_size, expected_sha256
                 ):
                     print(
                         f"✓ 文件完整: {filename} ({expected_size / (1024*1024):.1f} MB)"
