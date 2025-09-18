@@ -328,7 +328,7 @@ class XgetHFDownloader:
                 return False
 
         # 对小文件验证 SHA256（如果提供了哈希值）
-        if expected_sha256 and expected_size and expected_size < 500 * 1024 * 1024:
+        if expected_sha256 and expected_size:
             try:
                 sha256_hash = hashlib.sha256()
                 with open(file_path, "rb") as f:
@@ -548,8 +548,8 @@ class XgetHFDownloader:
                             f.cancel()
                         break
 
-                    url, local_path, file_info, url_type = future_to_task[future]
                     try:
+                        url, local_path, file_info, url_type, hf_mirror_param = future_to_task[future]
                         success = future.result()
                         if success:
                             successful_downloads += 1
