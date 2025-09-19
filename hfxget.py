@@ -22,8 +22,6 @@ from pathlib import Path
 try:
     import requests
     import urllib3
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
 
     REQUESTS_AVAILABLE = True
 except ImportError:
@@ -61,7 +59,7 @@ class DownloaderInterface(ABC):
     """下载器抽象接口"""
 
     @abstractmethod
-    def download_file(self, url, local_path, resume=True, max_retries=3):
+    def download_file(self, url, local_path, resume=True):
         """下载单个文件"""
         pass
 
@@ -77,7 +75,7 @@ class RequestsDownloader(DownloaderInterface):
     def get_name(self):
         return "requests"
 
-    def download_file(self, url, local_path, resume=True, max_retries=3):
+    def download_file(self, url, local_path, resume=True):
         """使用 requests 下载文件"""
         if not REQUESTS_AVAILABLE:
             raise ImportError("requests 库未安装，请运行: pip install requests")
@@ -85,19 +83,16 @@ class RequestsDownloader(DownloaderInterface):
         local_path = Path(local_path)
         local_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # 如果不使用断点续传，直接下载到目标位置
         if not resume:
             temp_path = local_path
             if local_path.exists():
                 print(f"覆盖现有文件: {local_path.name}")
         else:
-            # 使用 .incomplete 后缀的临时文件
             temp_path = local_path.with_suffix(local_path.suffix + ".incomplete")
             if local_path.exists():
                 print(f"文件已存在，跳过: {local_path.name}")
                 return True
 
-        # 配置请求会话
         session = requests.Session()
         session.headers.update(
             {
@@ -109,116 +104,80 @@ class RequestsDownloader(DownloaderInterface):
             }
         )
 
-        # 禁用SSL警告
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-        # 配置重试策略
-        retry_strategy = Retry(
-            total=max_retries,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "OPTIONS"],
-        )
+        headers = session.headers.copy()
+        mode = "wb"
+        initial_pos = 0
 
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
+        if resume and temp_path.exists() and temp_path != local_path:
+            initial_pos = temp_path.stat().st_size
+            headers["Range"] = f"bytes={initial_pos}-"
+            mode = "ab"
+            print(
+                f"断点续传: {local_path.name} (从 {initial_pos / (1024*1024):.1f} MB 开始)"
+            )
 
-        for attempt in range(max_retries + 1):
-            headers = session.headers.copy()
-            mode = "wb"
-            initial_pos = 0
+        try:
+            response = session.get(
+                url,
+                headers=headers,
+                stream=True,
+                timeout=(30, 60),
+                verify=True,
+                allow_redirects=True,
+            )
 
-            # 检查断点续传
-            if resume and temp_path.exists() and temp_path != local_path:
-                initial_pos = temp_path.stat().st_size
-                headers["Range"] = f"bytes={initial_pos}-"
-                mode = "ab"
-                print(
-                    f"断点续传: {local_path.name} (从 {initial_pos / (1024*1024):.1f} MB 开始)"
-                )
-
-            try:
-                response = session.get(
-                    url,
-                    headers=headers,
-                    stream=True,
-                    timeout=(30, 60),
-                    verify=True,
-                    allow_redirects=True,
-                )
-
-                if response.status_code == 416 and resume:
-                    if temp_path.exists() and temp_path != local_path:
-                        temp_path.rename(local_path)
-                        print(f"文件已完整，重命名: {local_path.name}")
-                        return True
-                    return True
-
-                response.raise_for_status()
-                total_size = (
-                    int(response.headers.get("content-length", 0)) + initial_pos
-                )
-
-                with open(temp_path, mode) as f:
-                    with tqdm(
-                        desc=local_path.name,
-                        total=total_size,
-                        initial=initial_pos,
-                        unit="B",
-                        unit_scale=True,
-                        unit_divisor=1024,
-                        leave=False,
-                        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
-                    ) as pbar:
-                        for chunk in response.iter_content(chunk_size=65536):
-                            # 检查是否被中断
-                            if interrupted:
-                                print(f"\n⚠️  下载被中断: {local_path.name}")
-                                return False
-                            if chunk:
-                                f.write(chunk)
-                                pbar.update(len(chunk))
-
-                # 重命名临时文件
-                if resume and temp_path != local_path:
+            if response.status_code == 416 and resume:
+                if temp_path.exists() and temp_path != local_path:
                     temp_path.rename(local_path)
-
+                    print(f"文件已完整，重命名: {local_path.name}")
+                    return True
                 return True
 
-            except Exception as e:
-                # 检查是否是401错误，如果是则不重试
-                if (
-                    hasattr(e, "response")
-                    and e.response is not None
-                    and e.response.status_code in [401, 403, 404]
-                ):
-                    print(f"{e.response.status_code}错误，停止重试: {local_path.name}")
-                    print(f"错误: {str(e)}")
-                    if resume and temp_path.exists() and temp_path != local_path:
-                        try:
-                            temp_path.unlink()
-                        except OSError:
-                            pass
-                    return False
+            response.raise_for_status()
+            total_size = int(response.headers.get("content-length", 0)) + initial_pos
 
-                if attempt < max_retries:
-                    print(
-                        f"下载失败 (尝试 {attempt + 1}/{max_retries + 1}): {local_path.name}"
-                    )
-                    print(f"错误: {str(e)}")
-                    time.sleep(2**attempt)
-                    continue
-                else:
-                    print(f"下载 {local_path.name} 失败: {str(e)}")
-                    if resume and temp_path.exists() and temp_path != local_path:
-                        try:
-                            temp_path.unlink()
-                        except OSError:
-                            pass
-                    return False
+            with open(temp_path, mode) as f:
+                with tqdm(
+                    desc=local_path.name,
+                    total=total_size,
+                    initial=initial_pos,
+                    unit="B",
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    leave=False,
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+                ) as pbar:
+                    for chunk in response.iter_content(chunk_size=65536):
+                        if interrupted:
+                            print(f"\n⚠️  下载被中断: {local_path.name}")
+                            return False
+                        if chunk:
+                            f.write(chunk)
+                            pbar.update(len(chunk))
 
-        return False
+            if resume and temp_path != local_path:
+                temp_path.rename(local_path)
+
+            return True
+
+        except Exception as e:
+            if (
+                hasattr(e, 'response')
+                and e.response is not None
+                and e.response.status_code in [401, 403, 404]
+            ):
+                print(f"{e.response.status_code}错误: {local_path.name}")
+            else:
+                print(f"下载失败: {local_path.name}")
+            print(f"错误: {str(e)}")
+            if resume and temp_path.exists() and temp_path != local_path:
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+            return False
 
 
 class XgetHFDownloader:
@@ -435,60 +394,93 @@ class XgetHFDownloader:
         self, url, local_dir, local_path, file_info, url_type, hf_mirror_param
     ):
         """下载文件并验证完整性"""
-        # 检查是否被中断
-        if interrupted:
-            print(f"⚠️  下载被中断，跳过: {local_path.name}")
-            return False
 
-        print(f"正在下载: {local_path.name} (使用 {url_type})")
+        max_attempts = 5
+        attempt = 0
 
-        if url_type == "Xget":
-            try:
-                success = self.downloader.download_file(url, local_path, resume=True)
-                if not success:
-                    print(f"Xget 下载失败: {local_path.name}")
-            except Exception as e:
-                print(
-                    f"Xget 下载失败: {local_path.name}，{e}\n{traceback.format_exc()}"
-                )
-                success = False
-            if success:
-                if not self.verify_file_integrity(local_dir, local_path, file_info):
-                    print(f"下载完成但验证失败，删除文件: {local_path.name}")
-                    try:
-                        local_path.unlink()
-                    except OSError:
-                        pass
-                    return False
+        while attempt < max_attempts:
+            if interrupted:
+                print(f"⚠️  下载被中断，跳过: {local_path.name}")
+                return {"success": False, "downloaded": False, "url_type": url_type}
 
-                size_mb = (
-                    (local_path.stat().st_size / (1024 * 1024))
-                    if local_path.exists()
-                    else 0
-                )
-                print(f"✓ 下载成功: {local_path.name} ({size_mb:.3f} MB)")
+            if self.verify_file_integrity(local_dir, local_path, file_info):
+                print(f"✓ 文件已验证: {local_path.name}")
+                return {"success": True, "downloaded": False, "url_type": url_type}
+
+            attempt += 1
+            attempt_note = f" [尝试 {attempt}/{max_attempts}]" if max_attempts > 1 else ""
+            print(f"正在下载: {local_path.name} (使用 {url_type}){attempt_note}")
+
+            download_success = False
+            performed_download = False
+
+            if url_type == "Xget":
+                try:
+                    print(f"Xget 下载 URL: {url}")
+                    download_success = self.downloader.download_file(
+                        url, local_path, resume=True
+                    )
+                    performed_download = True
+                    if not download_success:
+                        print(f"Xget 下载失败: {local_path.name}")
+                except Exception as e:
+                    print(f"Xget 下载异常: {local_path.name}，{e}\n{traceback.format_exc()}")
+                    download_success = False
+                    performed_download = True
+            else:
+                try:
+                    print(f"hf-mirror 下载参数: {hf_mirror_param}")
+                    self.hf_api.hf_hub_download(
+                        **hf_mirror_param, local_dir=local_dir, resume_download=True
+                    )
+                    download_success = True
+                    performed_download = True
+                except Exception as e:
+                    if (
+                        hasattr(e, "response")
+                        and e.response is not None
+                        and e.response.status_code in [401, 403, 404]
+                    ):
+                        print(f"{e.response.status_code}错误，停止下载: {local_path.name}")
+                        print(f"错误: {str(e)}")
+                        return {
+                            "success": False,
+                            "downloaded": performed_download,
+                            "url_type": url_type,
+                        }
+                    print(f"镜像下载失败 (尝试 {attempt}/{max_attempts}): {local_path.name}，{e}\n{traceback.format_exc()}")
+                    download_success = False
+                    performed_download = True
+
+            if not download_success:
+                if attempt < max_attempts:
+                    time.sleep(2 ** (attempt - 1))
+                    continue
+                return {"success": False, "downloaded": performed_download, "url_type": url_type}
+
+            if self.verify_file_integrity(local_dir, local_path, file_info):
+                if local_path.exists():
+                    size_mb = local_path.stat().st_size / (1024 * 1024)
+                    print(f"✓ 下载成功: {local_path.name} ({size_mb:.3f} MB)")
+                else:
+                    print(f"✓ 下载成功: {local_path.name}")
                 self._write_local_metadata(local_dir, file_info)
-                return True
-        for retry in range(4):
-            try:
-                self.hf_api.hf_hub_download(
-                    **hf_mirror_param, local_dir=local_dir, resume_download=True
-                )
-                self._write_local_metadata(local_dir, file_info)
-                return True
-            except Exception as e:
-                # 检查是否是401错误，如果是则不重试
-                if (
-                    hasattr(e, "response")
-                    and e.response is not None
-                    and e.response.status_code in [401, 403, 404]
-                ):
-                    print(f"{e.response.status_code}错误，停止下载: {local_path.name}")
-                    print(f"错误: {str(e)}")
-                    return False
-                print(f"{retry}/{4}次下载失败: {local_path.name}，{e}\n{traceback.format_exc()}")
-                time.sleep(2)
-        return False
+                return {"success": True, "downloaded": performed_download, "url_type": url_type}
+
+            print(f"下载完成但验证失败，删除文件: {local_path.name}")
+            if local_path.exists():
+                try:
+                    local_path.unlink()
+                except OSError:
+                    pass
+
+            if attempt < max_attempts:
+                time.sleep(2 ** (attempt - 1))
+                continue
+
+            return {"success": False, "downloaded": performed_download, "url_type": url_type}
+
+        return {"success": False, "downloaded": False, "url_type": url_type}
 
     def download_repo(
         self,
@@ -547,54 +539,29 @@ class XgetHFDownloader:
         print(f"  🔗 LFS文件 (Xget): {len(lfs_files)}")
         print(f"  📄 普通文件 (hf-mirror): {len(regular_files)}")
 
-        # 检查哪些文件需要下载
+        # 构建下载任务列表
         files_to_download = []
-        files_already_complete = 0
 
         for file_info in files_info:
             filename = file_info["filename"]
             local_path = local_dir / filename
             is_lfs = self.is_lfs_file(file_info)
 
-            # 检查文件是否需要下载
-            needs_download = False
-            reason = ""
+            url, url_type, hf_mirror_param = self.build_download_url(
+                repo_id, filename, repo_type, revision, is_lfs
+            )
+            print(f"→ 准备处理: {filename} - 使用 {url_type}")
+            files_to_download.append(
+                (url, local_path, file_info, url_type, hf_mirror_param)
+            )
 
-            if not local_path.exists():
-                needs_download = True
-                reason = "文件不存在"
-            else:
-                if self.verify_file_integrity(local_dir, local_path, file_info):
-                    expected_size = file_info.get("size")
-                    size_info = (
-                        f" ({expected_size / (1024*1024):.1f} MB)"
-                        if expected_size
-                        else ""
-                    )
-                    print(f"✓ 文件完整: {filename}{size_info}")
-                    files_already_complete += 1
-                    continue
-                else:
-                    needs_download = True
-                    reason = "文件不完整或元数据不匹配"
-
-            if needs_download:
-                url, url_type, hf_mirror_param = self.build_download_url(
-                    repo_id, filename, repo_type, revision, is_lfs
-                )
-                print(f"→ 需要下载: {filename} ({reason}) - 使用 {url_type}")
-                files_to_download.append(
-                    (url, local_path, file_info, url_type, hf_mirror_param)
-                )
-
-        print(f"\n需要下载: {len(files_to_download)} 个文件")
-        print(f"已完整: {files_already_complete} 个文件")
+        print(f"\n需要处理: {len(files_to_download)} 个文件")
 
         if not files_to_download:
-            print("所有文件已下载完成")
+            print("未发现可处理的文件")
             return True
 
-        print(f"开始下载 {len(files_to_download)} 个文件")
+        print(f"开始处理 {len(files_to_download)} 个文件")
 
         # 并发下载文件
         successful_downloads = 0
@@ -603,6 +570,7 @@ class XgetHFDownloader:
         start_time = time.time()
         xget_downloads = 0
         mirror_downloads = 0
+        verified_without_downloads = 0
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_task = {
@@ -635,8 +603,23 @@ class XgetHFDownloader:
 
                     try:
                         url, local_path, file_info, url_type, hf_mirror_param = future_to_task[future]
-                        success = future.result()
-                        if success:
+                        result = future.result()
+                        if isinstance(result, dict):
+                            if result.get("success"):
+                                successful_downloads += 1
+                                if result.get("downloaded"):
+                                    if result.get("url_type") == "Xget":
+                                        xget_downloads += 1
+                                    else:
+                                        mirror_downloads += 1
+                                    if local_path.exists():
+                                        total_bytes_downloaded += local_path.stat().st_size
+                                else:
+                                    verified_without_downloads += 1
+                            else:
+                                failed_downloads += 1
+                                print(f"失败: {file_info['filename']}")
+                        elif result:
                             successful_downloads += 1
                             if url_type == "Xget":
                                 xget_downloads += 1
@@ -660,6 +643,7 @@ class XgetHFDownloader:
                                 {
                                     "成功": successful_downloads,
                                     "失败": failed_downloads,
+                                    "已验证": verified_without_downloads,
                                     "平均速度": f"{avg_speed / (1024*1024):.1f} MB/s",
                                 }
                             )
@@ -670,6 +654,7 @@ class XgetHFDownloader:
 
         print(f"\n📊 下载统计:")
         print(f"  ✅ 成功: {successful_downloads}")
+        print(f"    🔄 已存在验证: {verified_without_downloads}")
         print(f"    🔗 Xget下载: {xget_downloads}")
         print(f"    🪞 镜像下载: {mirror_downloads}")
         print(f"  ❌ 失败: {failed_downloads}")
