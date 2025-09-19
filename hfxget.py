@@ -11,7 +11,6 @@ Xget Hugging Face 下载加速器
 """
 
 import argparse
-import hashlib
 import signal
 import sys
 import time
@@ -31,6 +30,15 @@ except ImportError:
     REQUESTS_AVAILABLE = False
 
 from huggingface_hub import HfApi
+
+try:
+    from huggingface_hub._local_folder import (
+        read_download_metadata as hf_read_download_metadata,
+        write_download_metadata as hf_write_download_metadata,
+    )
+except ImportError:
+    hf_write_download_metadata = None
+    hf_read_download_metadata = None
 from tqdm import tqdm
 
 # 全局变量用于跟踪中断状态
@@ -227,6 +235,9 @@ class XgetHFDownloader:
         # LFS 文件大小阈值 (100MB)
         self.lfs_size_threshold = 100 * 1024 * 1024
 
+        # 缓存当前解析到的提交哈希，供写入元数据使用
+        self.resolved_commit_hash = None
+
         # 选择下载器
         if downloader_type == "requests":
             self.downloader = RequestsDownloader()
@@ -244,6 +255,12 @@ class XgetHFDownloader:
 
             repo_info = self.hf_api.repo_info(
                 repo_id, repo_type=repo_type, revision=revision, files_metadata=True
+            )
+
+            self.resolved_commit_hash = (
+                getattr(repo_info, "sha", None)
+                or getattr(repo_info, "commit", None)
+                or getattr(repo_info, "commit_hash", None)
             )
 
             files_info = []
@@ -311,14 +328,33 @@ class XgetHFDownloader:
 
         return download_url, url_type, hf_mirror_param
 
-    def verify_file_integrity(
-        self, file_path, expected_size=None, expected_sha256=None
-    ):
-        """验证文件完整性"""
+    def _extract_file_etag(self, file_info):
+        """从文件信息中解析期望的 ETag。"""
+
+        lfs_info = file_info.get("lfs")
+        if lfs_info is not None:
+            sha256 = getattr(lfs_info, "sha256", None)
+            if sha256 is None and isinstance(lfs_info, dict):
+                sha256 = lfs_info.get("sha256")
+            if sha256:
+                return sha256
+
+            oid = getattr(lfs_info, "oid", None)
+            if oid is None and isinstance(lfs_info, dict):
+                oid = lfs_info.get("oid")
+            if isinstance(oid, str) and oid.startswith("sha256:"):
+                return oid.split(":", 1)[1]
+            return oid
+
+        return file_info.get("blob_id")
+
+    def verify_file_integrity(self, local_dir, file_path, file_info):
+        """通过元数据验证文件完整性。"""
+
         if not file_path.exists():
             return False
 
-        # 检查文件大小
+        expected_size = file_info.get("size")
         if expected_size is not None:
             actual_size = file_path.stat().st_size
             if actual_size != expected_size:
@@ -327,26 +363,65 @@ class XgetHFDownloader:
                 )
                 return False
             print(f"文件大小匹配 {file_path.name}: 期望 {expected_size}, 实际 {actual_size}")
-        # 对小文件验证 SHA256（如果提供了哈希值）
-        if expected_sha256:
-            try:
-                sha256_hash = hashlib.sha256()
-                with open(file_path, "rb") as f:
-                    for chunk in iter(lambda: f.read(8192), b""):
-                        sha256_hash.update(chunk)
 
-                actual_sha256 = sha256_hash.hexdigest()
-                if actual_sha256 != expected_sha256:
-                    print(
-                        f"SHA256不匹配 {file_path.name}: 期望 {expected_sha256}, 实际 {actual_sha256}"
-                    )
-                    return False
-                print(f"SHA256匹配 {file_path.name}: 期望 {expected_sha256}, 实际 {actual_sha256}")
+        metadata = None
+        filename = file_info.get("filename")
+        if filename and hf_read_download_metadata is not None:
+            try:
+                metadata = hf_read_download_metadata(Path(local_dir), filename)
             except Exception as e:
-                print(f"SHA256验证失败 {file_path.name}: {e}")
-                return False
+                print(f"⚠️  读取元数据失败 {file_path.name}: {e}")
+
+        if metadata is None:
+            self._write_local_metadata(local_dir, file_info)
+            if filename and hf_read_download_metadata is not None:
+                try:
+                    metadata = hf_read_download_metadata(Path(local_dir), filename)
+                except Exception as e:
+                    print(f"⚠️  读取元数据失败 {file_path.name}: {e}")
+
+        if metadata is None:
+            print(f"⚠️  未找到有效元数据 {file_path.name}")
+            return False
+
+        if (
+            self.resolved_commit_hash
+            and metadata.commit_hash
+            and metadata.commit_hash != self.resolved_commit_hash
+        ):
+            print(
+                f"提交哈希不匹配 {file_path.name}: 当前 {self.resolved_commit_hash}, 元数据 {metadata.commit_hash}"
+            )
+            return False
+        print(f"✓ 提交哈希匹配 {file_path.name}: {metadata.commit_hash}")
+
         print(f"文件完整性验证成功 {file_path.name}")
         return True
+
+    def _write_local_metadata(self, local_dir, file_info):
+        """将下载的文件元数据写入本地缓存目录。"""
+
+        if hf_write_download_metadata is None:
+            return
+
+        if not self.resolved_commit_hash:
+            return
+
+        etag = self._extract_file_etag(file_info)
+
+        if not etag:
+            return
+
+        filename = file_info.get("filename")
+        if not filename:
+            return
+
+        try:
+            hf_write_download_metadata(
+                Path(local_dir), filename, self.resolved_commit_hash, etag
+            )
+        except Exception as e:
+            print(f"⚠️  写入元数据失败 {file_info['filename']}: {e}")
 
     def download_and_verify_file(
         self, url, local_dir, local_path, file_info, url_type, hf_mirror_param
@@ -370,17 +445,13 @@ class XgetHFDownloader:
                 )
                 success = False
             if success:
-                # 验证文件完整性
-                expected_size = file_info.get("size")
-                expected_sha256 = file_info.get("lfs").sha256
-                if expected_size and local_path.exists():
-                    if not self.verify_file_integrity(local_path, expected_size, expected_sha256):
-                        print(f"下载完成但验证失败，删除文件: {local_path.name}")
-                        try:
-                            local_path.unlink()
-                        except OSError:
-                            pass
-                        return False
+                if not self.verify_file_integrity(local_dir, local_path, file_info):
+                    print(f"下载完成但验证失败，删除文件: {local_path.name}")
+                    try:
+                        local_path.unlink()
+                    except OSError:
+                        pass
+                    return False
 
                 size_mb = (
                     (local_path.stat().st_size / (1024 * 1024))
@@ -388,12 +459,14 @@ class XgetHFDownloader:
                     else 0
                 )
                 print(f"✓ 下载成功: {local_path.name} ({size_mb:.3f} MB)")
+                self._write_local_metadata(local_dir, file_info)
                 return True
         for retry in range(4):
             try:
                 self.hf_api.hf_hub_download(
                     **hf_mirror_param, local_dir=local_dir, resume_download=True
                 )
+                self._write_local_metadata(local_dir, file_info)
                 return True
             except Exception as e:
                 # 检查是否是401错误，如果是则不重试
@@ -483,23 +556,19 @@ class XgetHFDownloader:
                 needs_download = True
                 reason = "文件不存在"
             else:
-                # 检查文件完整性
-                expected_size = file_info.get("size")
-                if is_lfs:
-                    expected_sha256 = file_info.get("lfs").sha256
-                else:
-                    expected_sha256 = None
-                if expected_size and self.verify_file_integrity(
-                    local_path, expected_size, expected_sha256
-                ):
-                    print(
-                        f"✓ 文件完整: {filename} ({expected_size / (1024*1024):.1f} MB)"
+                if self.verify_file_integrity(local_dir, local_path, file_info):
+                    expected_size = file_info.get("size")
+                    size_info = (
+                        f" ({expected_size / (1024*1024):.1f} MB)"
+                        if expected_size
+                        else ""
                     )
+                    print(f"✓ 文件完整: {filename}{size_info}")
                     files_already_complete += 1
                     continue
                 else:
                     needs_download = True
-                    reason = "文件不完整或大小不匹配"
+                    reason = "文件不完整或元数据不匹配"
 
             if needs_download:
                 url, url_type, hf_mirror_param = self.build_download_url(
