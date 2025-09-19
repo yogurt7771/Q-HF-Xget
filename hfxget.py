@@ -384,6 +384,14 @@ class XgetHFDownloader:
             print(f"⚠️  未找到有效元数据 {file_path.name}")
             return False
 
+        expected_etag = self._extract_file_etag(file_info)
+        if expected_etag and metadata.etag != expected_etag:
+            print(
+                f"ETag 不匹配 {file_path.name}: 期望 {expected_etag}, 元数据 {metadata.etag}"
+            )
+            return False
+        print(f"✓ ETag 匹配 {file_path.name}: {metadata.etag}")
+
         if (
             self.resolved_commit_hash
             and metadata.commit_hash
