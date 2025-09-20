@@ -191,8 +191,8 @@ class XgetHFDownloader:
         self.hf_mirror_url = hf_mirror_url
         self.hf_api = HfApi(endpoint=hf_mirror_url)
 
-        # LFS 文件大小阈值 (100MB)
-        self.lfs_size_threshold = 100 * 1024 * 1024
+        # LFS 文件大小阈值 (50MB)
+        self.lfs_size_threshold = 50 * 1024 * 1024
 
         # 缓存当前解析到的提交哈希，供写入元数据使用
         self.resolved_commit_hash = None
@@ -251,6 +251,8 @@ class XgetHFDownloader:
         """判断文件是否为 LFS 文件"""
         # 如果 API 直接标记了 LFS
         print(file_info)
+        if file_info.get("size", 0) < self.lfs_size_threshold:
+            return False
         if file_info.get("lfs"):
             return True
 
