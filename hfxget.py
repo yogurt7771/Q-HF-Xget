@@ -86,11 +86,11 @@ class RequestsDownloader(DownloaderInterface):
         if not resume:
             temp_path = local_path
             if local_path.exists():
-                print(f"覆盖现有文件: {local_path.name}")
+                print(f"♻️  覆盖现有文件: {local_path.name}")
         else:
             temp_path = local_path.with_suffix(local_path.suffix + ".incomplete")
             if local_path.exists():
-                print(f"文件已存在，跳过: {local_path.name}")
+                print(f"✅ 已存在且跳过: {local_path.name}")
                 return True
 
         session = requests.Session()
@@ -131,7 +131,7 @@ class RequestsDownloader(DownloaderInterface):
             if response.status_code == 416 and resume:
                 if temp_path.exists() and temp_path != local_path:
                     temp_path.rename(local_path)
-                    print(f"文件已完整，重命名: {local_path.name}")
+                    print(f"✅ 本地已完整，重命名: {local_path.name}")
                     return True
                 return True
 
@@ -151,7 +151,7 @@ class RequestsDownloader(DownloaderInterface):
                 ) as pbar:
                     for chunk in response.iter_content(chunk_size=65536):
                         if interrupted:
-                            print(f"\n⚠️  下载被中断: {local_path.name}")
+                            print(f"\n⏹️  下载被中断: {local_path.name}")
                             return False
                         if chunk:
                             f.write(chunk)
@@ -168,10 +168,10 @@ class RequestsDownloader(DownloaderInterface):
                 and e.response is not None
                 and e.response.status_code in [401, 403, 404]
             ):
-                print(f"{e.response.status_code}错误: {local_path.name}")
+                print(f"🚫 HTTP {e.response.status_code}: {local_path.name}")
             else:
-                print(f"下载失败: {local_path.name}")
-            print(f"错误: {str(e)}")
+                print(f"❌ 下载失败: {local_path.name}")
+            print(f"原因: {str(e)}")
             if resume and temp_path.exists() and temp_path != local_path:
                 try:
                     temp_path.unlink()
@@ -203,14 +203,16 @@ class XgetHFDownloader:
         else:
             raise ValueError(f"不支持的下载器类型: {downloader_type}")
 
-        print(f"使用下载核心: {self.downloader.get_name()}")
-        print(f"HF 镜像: {self.hf_mirror_url}")
-        print(f"Xget 加速: {self.xget_base_url}")
+        print(f"🛠️  下载核心: {self.downloader.get_name()}")
+        print(f"🪞  HF 镜像: {self.hf_mirror_url}")
+        print(f"🚀  Xget 加速: {self.xget_base_url}")
 
     def get_repo_file_list(self, repo_id, repo_type="model", revision="main"):
         """获取仓库文件列表和详细信息"""
         try:
-            print(f"正在获取 {repo_type} {repo_id} 的文件列表...")
+            print(
+                f"📡 获取文件列表: {repo_type} {repo_id} @ {revision}"
+            )
 
             repo_info = self.hf_api.repo_info(
                 repo_id, repo_type=repo_type, revision=revision, files_metadata=True
@@ -241,22 +243,17 @@ class XgetHFDownloader:
                 and e.response is not None
                 and e.response.status_code == 401
             ):
-                print(f"401未授权错误，无法访问仓库: {repo_id}")
-                print(f"错误: {str(e)}")
+                print(f"🚫 访问受限 (401): {repo_id} | {e}")
                 return []
-            print(f"获取文件列表失败: {e}")
+            print(f"❌ 获取文件列表失败: {e}")
             return []
 
     def is_lfs_file(self, file_info):
         """判断文件是否为 LFS 文件"""
-        # 如果 API 直接标记了 LFS
-        print(file_info)
         if file_info.get("size", 0) < self.lfs_size_threshold:
             return False
-        if file_info.get("lfs"):
-            return True
 
-        return False
+        return bool(file_info.get("lfs"))
 
     def build_download_url(
         self, repo_id, filename, repo_type="model", revision="main", is_lfs=False
@@ -320,10 +317,9 @@ class XgetHFDownloader:
             actual_size = file_path.stat().st_size
             if actual_size != expected_size:
                 print(
-                    f"文件大小不匹配 {file_path.name}: 期望 {expected_size}, 实际 {actual_size}"
+                    f"❌ 文件大小不匹配: {file_path.name} | 期望 {expected_size}, 实际 {actual_size}"
                 )
                 return False
-            print(f"文件大小匹配 {file_path.name}: 期望 {expected_size}, 实际 {actual_size}")
 
         metadata = None
         filename = file_info.get("filename")
@@ -348,10 +344,9 @@ class XgetHFDownloader:
         expected_etag = self._extract_file_etag(file_info)
         if expected_etag and metadata.etag != expected_etag:
             print(
-                f"ETag 不匹配 {file_path.name}: 期望 {expected_etag}, 元数据 {metadata.etag}"
+                f"❌ ETag 不匹配: {file_path.name} | 期望 {expected_etag}, 实际 {metadata.etag}"
             )
             return False
-        print(f"✓ ETag 匹配 {file_path.name}: {metadata.etag}")
 
         if (
             self.resolved_commit_hash
@@ -359,12 +354,10 @@ class XgetHFDownloader:
             and metadata.commit_hash != self.resolved_commit_hash
         ):
             print(
-                f"提交哈希不匹配 {file_path.name}: 当前 {self.resolved_commit_hash}, 元数据 {metadata.commit_hash}"
+                f"❌ 提交哈希不匹配: {file_path.name} | 当前 {self.resolved_commit_hash}, 元数据 {metadata.commit_hash}"
             )
             return False
-        print(f"✓ 提交哈希匹配 {file_path.name}: {metadata.commit_hash}")
 
-        print(f"文件完整性验证成功 {file_path.name}")
         return True
 
     def _write_local_metadata(self, local_dir, file_info):
@@ -402,74 +395,80 @@ class XgetHFDownloader:
 
         while attempt < max_attempts:
             if interrupted:
-                print(f"⚠️  下载被中断，跳过: {local_path.name}")
+                print(f"⏹️  下载被中断，跳过: {local_path.name}")
                 return {"success": False, "downloaded": False, "url_type": url_type}
 
             if self.verify_file_integrity(local_dir, local_path, file_info):
-                print(f"✓ 文件已验证: {local_path.name}")
+                print(f"✅ 已存在且通过校验: {local_path.name}")
                 return {"success": True, "downloaded": False, "url_type": url_type}
 
             attempt += 1
-            attempt_note = f" [尝试 {attempt}/{max_attempts}]" if max_attempts > 1 else ""
-            print(f"正在下载: {local_path.name} (使用 {url_type}){attempt_note}")
+            attempt_note = f"{attempt}/{max_attempts}"
+            print(
+                f"📥 开始下载: {local_path.name} | 来源: {url_type} | 尝试 {attempt_note}"
+            )
 
             download_success = False
             performed_download = False
 
             if url_type == "Xget":
                 try:
-                    print(f"Xget 下载 URL: {url}")
                     download_success = self.downloader.download_file(
                         url, local_path, resume=True
                     )
                     performed_download = True
                     if not download_success:
-                        print(f"Xget 下载失败: {local_path.name}")
+                        print(f"⚠️ Xget 下载未完成: {local_path.name}")
                 except Exception as e:
-                    print(f"Xget 下载异常: {local_path.name}，{e}\n{traceback.format_exc()}")
-                    download_success = False
                     performed_download = True
+                    print(f"❌ Xget 下载异常: {local_path.name} | {e}")
+                    print(traceback.format_exc())
             else:
                 try:
-                    print(f"hf-mirror 下载参数: {hf_mirror_param}")
                     self.hf_api.hf_hub_download(
                         **hf_mirror_param, local_dir=local_dir, resume_download=True
                     )
                     download_success = True
                     performed_download = True
                 except Exception as e:
+                    performed_download = True
                     if (
                         hasattr(e, "response")
                         and e.response is not None
                         and e.response.status_code in [401, 403, 404]
                     ):
-                        print(f"{e.response.status_code}错误，停止下载: {local_path.name}")
-                        print(f"错误: {str(e)}")
+                        print(
+                            f"🚫 HF 镜像访问受限 ({e.response.status_code}): {local_path.name} | {e}"
+                        )
                         return {
                             "success": False,
                             "downloaded": performed_download,
                             "url_type": url_type,
                         }
-                    print(f"镜像下载失败 (尝试 {attempt}/{max_attempts}): {local_path.name}，{e}\n{traceback.format_exc()}")
-                    download_success = False
-                    performed_download = True
+                    print(f"❌ 镜像下载异常: {local_path.name} | {e}")
+                    print(traceback.format_exc())
 
             if not download_success:
                 if attempt < max_attempts:
-                    time.sleep(2 ** (attempt - 1))
+                    wait_seconds = 2 ** (attempt - 1)
+                    print(
+                        f"🔁 准备重试: {local_path.name} | 下一次尝试 {attempt + 1}/{max_attempts} | 等待 {wait_seconds}s"
+                    )
+                    time.sleep(wait_seconds)
                     continue
+                print(f"🚫 放弃下载: {local_path.name} | 已达最大重试次数")
                 return {"success": False, "downloaded": performed_download, "url_type": url_type}
 
             if self.verify_file_integrity(local_dir, local_path, file_info):
                 if local_path.exists():
                     size_mb = local_path.stat().st_size / (1024 * 1024)
-                    print(f"✓ 下载成功: {local_path.name} ({size_mb:.3f} MB)")
+                    print(f"✅ 下载完成: {local_path.name} | {size_mb:.3f} MB")
                 else:
-                    print(f"✓ 下载成功: {local_path.name}")
+                    print(f"✅ 下载完成: {local_path.name}")
                 self._write_local_metadata(local_dir, file_info)
                 return {"success": True, "downloaded": performed_download, "url_type": url_type}
 
-            print(f"下载完成但验证失败，删除文件: {local_path.name}")
+            print(f"❌ 校验失败，已删除: {local_path.name}")
             if local_path.exists():
                 try:
                     local_path.unlink()
@@ -477,9 +476,14 @@ class XgetHFDownloader:
                     pass
 
             if attempt < max_attempts:
-                time.sleep(2 ** (attempt - 1))
+                wait_seconds = 2 ** (attempt - 1)
+                print(
+                    f"🔁 重新下载: {local_path.name} | 下一次尝试 {attempt + 1}/{max_attempts} | 等待 {wait_seconds}s"
+                )
+                time.sleep(wait_seconds)
                 continue
 
+            print(f"🚫 放弃下载: {local_path.name} | 校验持续失败")
             return {"success": False, "downloaded": performed_download, "url_type": url_type}
 
         return {"success": False, "downloaded": False, "url_type": url_type}
@@ -499,7 +503,7 @@ class XgetHFDownloader:
         try:
             self.hf_api.repo_info(repo_id, repo_type=repo_type, revision=revision)
         except Exception as e:
-            print(f"无效的仓库ID: {e}")
+            print(f"❌ 仓库信息无效: {e}")
             return False
 
         local_dir = Path(local_dir)
@@ -509,7 +513,7 @@ class XgetHFDownloader:
         files_info = self.get_repo_file_list(repo_id, repo_type, revision)
 
         if not files_info:
-            print("未找到文件或获取文件列表失败")
+            print("❌ 未找到文件或无法获取文件列表")
             return False
 
         # 过滤文件
@@ -537,11 +541,11 @@ class XgetHFDownloader:
             else:
                 regular_files.append(file_info)
 
-        print(f"找到 {len(files_info)} 个文件:")
-        print(f"  🔗 LFS文件 (Xget): {len(lfs_files)}")
-        print(f"  📄 普通文件 (hf-mirror): {len(regular_files)}")
+        total_files = len(files_info)
+        print(
+            f"📂 文件统计: 共 {total_files} 个 | LFS (Xget): {len(lfs_files)} | 普通 (hf-mirror): {len(regular_files)}"
+        )
 
-        # 构建下载任务列表
         files_to_download = []
 
         for file_info in files_info:
@@ -552,18 +556,19 @@ class XgetHFDownloader:
             url, url_type, hf_mirror_param = self.build_download_url(
                 repo_id, filename, repo_type, revision, is_lfs
             )
-            print(f"→ 准备处理: {filename} - 使用 {url_type}")
+            source_icon = "🔗" if url_type == "Xget" else "🪞"
+            print(f"{source_icon} 排队: {filename}")
             files_to_download.append(
                 (url, local_path, file_info, url_type, hf_mirror_param)
             )
 
-        print(f"\n需要处理: {len(files_to_download)} 个文件")
+        print(f"\n🧾 任务总数: {len(files_to_download)}")
 
         if not files_to_download:
-            print("未发现可处理的文件")
+            print("✅ 所有文件均已通过校验，无需下载")
             return True
 
-        print(f"开始处理 {len(files_to_download)} 个文件")
+        print("🚀 启动下载任务")
 
         # 并发下载文件
         successful_downloads = 0
@@ -620,7 +625,7 @@ class XgetHFDownloader:
                                     verified_without_downloads += 1
                             else:
                                 failed_downloads += 1
-                                print(f"失败: {file_info['filename']}")
+                                print(f"❌ 任务失败: {file_info['filename']}")
                         elif result:
                             successful_downloads += 1
                             if url_type == "Xget":
@@ -631,9 +636,9 @@ class XgetHFDownloader:
                                 total_bytes_downloaded += local_path.stat().st_size
                         else:
                             failed_downloads += 1
-                            print(f"失败: {file_info['filename']}")
+                            print(f"❌ 任务失败: {file_info['filename']}")
                     except Exception as e:
-                        print(f"下载任务异常: {e}")
+                        print(f"💥 任务异常: {local_path.name} | {e}")
                         failed_downloads += 1
                     finally:
                         main_pbar.update(1)
@@ -732,7 +737,7 @@ def main():
     if args.command == "download":
         # 检查下载器可用性
         if args.downloader == "requests" and not REQUESTS_AVAILABLE:
-            print("错误: requests 库未安装，请运行: pip install requests")
+            print("❌ requests 库未安装，请运行: pip install requests")
             return 1
 
         try:
@@ -740,7 +745,7 @@ def main():
                 args.xget_url, args.hf_mirror_url, args.downloader
             )
         except Exception as e:
-            print(f"初始化下载器失败: {e}")
+            print(f"❌ 初始化下载器失败: {e}")
             return 1
 
         success = downloader.download_repo(
