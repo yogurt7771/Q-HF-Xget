@@ -33,6 +33,7 @@ except ImportError:
     REQUESTS_AVAILABLE = False
 
 from huggingface_hub import HfApi
+from huggingface_hub.file_download import hf_hub_url
 from huggingface_hub.utils import build_hf_headers
 
 try:
@@ -516,8 +517,16 @@ class XgetHFDownloader:
             url_type = "Xget"
         else:
             # 普通文件使用 hf-mirror
-            download_url = None
+            # download_url = None
+            download_url = hf_hub_url(
+                repo_id,
+                filename,
+                repo_type=repo_type,
+                revision=revision,
+                endpoint=self.hf_mirror_url,
+            )
             url_type = "hf-mirror"
+
         hf_mirror_param = {
             "repo_id": repo_id,
             "filename": filename,
@@ -653,7 +662,7 @@ class XgetHFDownloader:
             performed_download = False
             final_source = url_type
 
-            if url_type == "Xget":
+            if url_type in ["Xget", "HfMirror"]:
                 try:
                     download_result = self.downloader.download_file(
                         url, local_path, resume=True
