@@ -636,30 +636,39 @@ class XgetHFDownloader:
             print(f"⚠️  写入元数据失败 {file_info['filename']}: {e}")
 
     def download_and_verify_file(
-        self, url, local_dir, local_path, file_info, url_type, hf_mirror_param
+        self,
+        url: str,
+        local_dir: Path,
+        local_path: Path,
+        file_info,
+        url_type,
+        hf_mirror_param,
+        max_attempts=5,
     ):
         """下载文件并验证完整性"""
 
-        max_attempts = 5
         attempt = 0
 
-        while attempt < max_attempts:
+        download_success = False
+        performed_download = False
+        while True:
             if interrupted:
                 print(f"⏹️  下载被中断，跳过: {local_path.name}")
                 return {"success": False, "downloaded": False, "url_type": url_type}
 
             if self.verify_file_integrity(local_dir, local_path, file_info):
                 print(f"✅ 已存在且通过校验: {local_path.name}")
-                return {"success": True, "downloaded": False, "url_type": url_type}
+                return {
+                    "success": True,
+                    "downloaded": performed_download,
+                    "url_type": url_type,
+                }
 
             attempt += 1
-            attempt_note = f"{attempt}/{max_attempts}"
+            attempt_note = f"{attempt}/{max_attempts}次尝试"
             print(
-                f"📥 开始下载: {local_path.name} | 来源: {url_type} | 尝试 {attempt_note}"
+                f"📥 开始下载: {local_path.name} | 来源: {url_type} | {attempt_note}"
             )
-
-            download_success = False
-            performed_download = False
             final_source = url_type
 
             if url_type in ["Xget", "HfMirror"]:
@@ -674,126 +683,55 @@ class XgetHFDownloader:
                     else:
                         status_code = download_result.status_code
                         if status_code in {401, 403, 404}:
-                            print(
-                                f"🔀 Xget 返回 {status_code}, 尝试切换 hf-mirror: {local_path.name}"
-                            )
-                            if local_path.exists():
-                                try:
-                                    local_path.unlink()
-                                except OSError:
-                                    pass
+                            print(f"🔀 Xget 下载错误：{status_code=}, 尝试切换 hf-mirror: {local_path.name}")
+                            local_path.unlink(missing_ok=True)
                             control_file = Path(str(local_path) + ".aria2")
-                            if control_file.exists():
-                                try:
-                                    control_file.unlink()
-                                except OSError:
-                                    pass
-                            try:
-                                self.hf_api.hf_hub_download(
-                                    **hf_mirror_param,
-                                    local_dir=local_dir,
-                                    resume_download=True,
-                                )
-                                download_success = True
-                                final_source = "hf-mirror"
-                                print(
-                                    f"✅ hf-mirror 回退成功: {local_path.name}"
-                                )
-                            except Exception as mirror_exc:
-                                print(
-                                    f"❌ hf-mirror 回退失败: {local_path.name} | {mirror_exc}"
-                                )
-                                if (
-                                    hasattr(mirror_exc, "response")
-                                    and mirror_exc.response is not None
-                                ):
-                                    status = mirror_exc.response.status_code
-                                    print(
-                                        f"🚫 hf-mirror 返回 {status}: {local_path.name}"
-                                    )
+                            control_file.unlink(missing_ok=True)
+                            url_type = "hf-mirror"
                         else:
                             message = download_result.message
                             if message:
-                                print(
-                                    f"⚠️ Xget 下载未完成: {local_path.name} | {message}"
-                                )
+                                print(f"⚠️ Xget 下载未完成: {local_path.name} | {message}")
                             else:
                                 print(f"⚠️ Xget 下载未完成: {local_path.name}")
                 except Exception as e:
                     performed_download = True
                     print(f"❌ Xget 下载异常: {local_path.name} | {e}")
                     print(traceback.format_exc())
-            else:
+            elif url_type in ["hf-mirror"]:
                 try:
-                    self.hf_api.hf_hub_download(
-                        **hf_mirror_param, local_dir=local_dir, resume_download=True
-                    )
+                    self.hf_api.hf_hub_download(**hf_mirror_param, local_dir=local_dir, resume_download=True)
                     download_success = True
                     performed_download = True
                 except Exception as e:
                     performed_download = True
-                    if (
-                        hasattr(e, "response")
-                        and e.response is not None
-                        and e.response.status_code in [401, 403, 404]
-                    ):
-                        print(
-                            f"🚫 HF 镜像访问受限 ({e.response.status_code}): {local_path.name} | {e}"
-                        )
+                    if hasattr(e, "response") and e.response is not None and e.response.status_code in [401, 403, 404]:
+                        print(f"🚫 HF 镜像访问受限 ({e.response.status_code}): {local_path.name} | {e}")
                         return {
                             "success": False,
                             "downloaded": performed_download,
                             "url_type": url_type,
                         }
                     print(f"❌ 镜像下载异常: {local_path.name} | {e}")
-                    print(traceback.format_exc())
+            else:
+                print(f"❌ 未知下载类型: {url_type} | {local_path.name}")
+                return {"success": False, "downloaded": False, "url_type": url_type}
 
             if not download_success:
                 if attempt < max_attempts:
-                    wait_seconds = 2 ** (attempt - 1)
-                    print(
-                        f"🔁 准备重试: {local_path.name} | 下一次尝试 {attempt + 1}/{max_attempts} | 等待 {wait_seconds}s"
-                    )
+                    wait_seconds = 2
+                    print(f"🔁 准备重试: {local_path.name} | 下一次尝试 {attempt + 1}/{max_attempts} | 等待 {wait_seconds}s")
                     time.sleep(wait_seconds)
                     continue
                 print(f"🚫 放弃下载: {local_path.name} | 已达最大重试次数")
                 return {"success": False, "downloaded": performed_download, "url_type": final_source}
 
-            if self.verify_file_integrity(local_dir, local_path, file_info):
+            if download_success:
                 if local_path.exists():
                     size_mb = local_path.stat().st_size / (1024 * 1024)
-                    print(f"✅ 下载完成: {local_path.name} | {size_mb:.3f} MB")
+                    print(f"✅ 下载结束: {local_path.name} | {size_mb:.3f} MB")
                 else:
-                    print(f"✅ 下载完成: {local_path.name}")
-                self._write_local_metadata(local_dir, file_info)
-                return {"success": True, "downloaded": performed_download, "url_type": final_source}
-
-            print(f"❌ 校验失败，已删除: {local_path.name}")
-            if local_path.exists():
-                try:
-                    local_path.unlink()
-                except OSError:
-                    pass
-
-            control_file = Path(str(local_path) + ".aria2")
-            if control_file.exists():
-                try:
-                    control_file.unlink()
-                except OSError:
-                    pass
-
-            if attempt < max_attempts:
-                wait_seconds = 2 ** (attempt - 1)
-                print(
-                    f"🔁 重新下载: {local_path.name} | 下一次尝试 {attempt + 1}/{max_attempts} | 等待 {wait_seconds}s"
-                )
-                time.sleep(wait_seconds)
-                continue
-
-            print(f"🚫 放弃下载: {local_path.name} | 校验持续失败")
-            return {"success": False, "downloaded": performed_download, "url_type": final_source}
-
-        return {"success": False, "downloaded": False, "url_type": url_type}
+                    print(f"✅ 下载结束: {local_path.name}")
 
     def download_repo(
         self,
