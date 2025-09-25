@@ -182,7 +182,7 @@ class RequestsDownloader(DownloaderInterface):
                 allow_redirects=True,
             )
 
-            if response.status_code == 416 and resume:
+            if response.status_code == 416:
                 if temp_path.exists() and temp_path != local_path:
                     local_path.unlink(missing_ok=True)
                     temp_path.rename(local_path)
@@ -212,7 +212,8 @@ class RequestsDownloader(DownloaderInterface):
                             f.write(chunk)
                             pbar.update(len(chunk))
 
-            if resume and temp_path != local_path:
+            if temp_path != local_path:
+                local_path.unlink(missing_ok=True)
                 temp_path.rename(local_path)
 
             return DownloadResult(success=True)
@@ -224,20 +225,11 @@ class RequestsDownloader(DownloaderInterface):
                 and e.response.status_code in [401, 403, 404]
             ):
                 print(f"🚫 HTTP {e.response.status_code}: {local_path.name}")
-                if resume and temp_path.exists() and temp_path != local_path:
-                    try:
-                        temp_path.unlink()
-                    except OSError:
-                        pass
+                temp_path.unlink(missing_ok=True)
                 return DownloadResult(success=False, status_code=e.response.status_code, message=str(e))
             else:
                 print(f"❌ 下载失败: {local_path.name}")
             print(f"原因: {str(e)}")
-            if resume and temp_path.exists() and temp_path != local_path:
-                try:
-                    temp_path.unlink()
-                except OSError:
-                    pass
             return DownloadResult(success=False, message=str(e))
 
 
