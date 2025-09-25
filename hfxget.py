@@ -184,6 +184,7 @@ class RequestsDownloader(DownloaderInterface):
 
             if response.status_code == 416 and resume:
                 if temp_path.exists() and temp_path != local_path:
+                    local_path.unlink(missing_ok=True)
                     temp_path.rename(local_path)
                     print(f"✅ 本地已完整，重命名: {local_path.name}")
                     return DownloadResult(success=True)
@@ -657,9 +658,7 @@ class XgetHFDownloader:
 
             if url_type in ["Xget", "HfMirror"]:
                 try:
-                    download_result = self.downloader.download_file(
-                        url, local_path, resume=True
-                    )
+                    download_result = self.downloader.download_file(url, local_path)
                     performed_download = True
 
                     if download_result.success:
