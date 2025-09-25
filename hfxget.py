@@ -35,15 +35,9 @@ except ImportError:
 from huggingface_hub import HfApi
 from huggingface_hub.file_download import hf_hub_url
 from huggingface_hub.utils import build_hf_headers
-
-try:
-    from huggingface_hub._local_folder import \
-        read_download_metadata as hf_read_download_metadata
-    from huggingface_hub._local_folder import \
-        write_download_metadata as hf_write_download_metadata
-except ImportError:
-    hf_write_download_metadata = None
-    hf_read_download_metadata = None
+from huggingface_hub.utils.sha import sha_fileobj, git_hash
+from huggingface_hub._local_folder import read_download_metadata as hf_read_download_metadata
+from huggingface_hub._local_folder import write_download_metadata as hf_write_download_metadata
 from tqdm import tqdm
 
 # 全局变量用于跟踪中断状态
@@ -160,9 +154,6 @@ class RequestsDownloader(DownloaderInterface):
                 print(f"♻️  覆盖现有文件: {local_path.name}")
         else:
             temp_path = local_path.with_suffix(local_path.suffix + ".incomplete")
-            if local_path.exists():
-                print(f"✅ 已存在且跳过: {local_path.name}")
-                return DownloadResult(success=True)
 
         session = requests.Session()
         session.headers.update(self.default_headers)
@@ -492,10 +483,7 @@ class XgetHFDownloader:
 
     def is_lfs_file(self, file_info):
         """判断文件是否为 LFS 文件"""
-        if file_info.get("size", 0) < self.lfs_size_threshold:
-            return False
-
-        return bool(file_info.get("lfs"))
+        return file_info.get("lfs") is not None
 
     def build_download_url(
         self, repo_id, filename, repo_type="model", revision="main", is_lfs=False
@@ -536,7 +524,7 @@ class XgetHFDownloader:
 
         return download_url, url_type, hf_mirror_param
 
-    def _extract_file_etag(self, file_info):
+    def _extract_expected_etag(self, file_info):
         """从文件信息中解析期望的 ETag。"""
 
         lfs_info = file_info.get("lfs")
@@ -573,25 +561,23 @@ class XgetHFDownloader:
 
         metadata = None
         filename = file_info.get("filename")
-        if filename and hf_read_download_metadata is not None:
+        try:
+            metadata = hf_read_download_metadata(Path(local_dir), filename)
+        except Exception as e:
+            print(f"⚠️  读取元数据失败 {file_path.name}: {e}")
+
+        if metadata is None:
+            self._write_local_metadata(local_dir, file_info)
             try:
                 metadata = hf_read_download_metadata(Path(local_dir), filename)
             except Exception as e:
                 print(f"⚠️  读取元数据失败 {file_path.name}: {e}")
 
         if metadata is None:
-            self._write_local_metadata(local_dir, file_info)
-            if filename and hf_read_download_metadata is not None:
-                try:
-                    metadata = hf_read_download_metadata(Path(local_dir), filename)
-                except Exception as e:
-                    print(f"⚠️  读取元数据失败 {file_path.name}: {e}")
-
-        if metadata is None:
             print(f"⚠️  未找到有效元数据 {file_path.name}")
             return False
 
-        expected_etag = self._extract_file_etag(file_info)
+        expected_etag = self._extract_expected_etag(file_info)
         if expected_etag and metadata.etag != expected_etag:
             print(
                 f"❌ ETag 不匹配: {file_path.name} | 期望 {expected_etag}, 实际 {metadata.etag}"
@@ -613,20 +599,13 @@ class XgetHFDownloader:
     def _write_local_metadata(self, local_dir, file_info):
         """将下载的文件元数据写入本地缓存目录。"""
 
-        if hf_write_download_metadata is None:
-            return
-
-        if not self.resolved_commit_hash:
-            return
-
-        etag = self._extract_file_etag(file_info)
-
-        if not etag:
-            return
-
         filename = file_info.get("filename")
-        if not filename:
-            return
+        if self.is_lfs_file(file_info):
+            with open(Path(local_dir) / filename, "rb") as f:
+                etag = sha_fileobj(f).hex()
+        else:
+            with open(Path(local_dir) / filename, "rb") as f:
+                etag = git_hash(f.read())
 
         try:
             hf_write_download_metadata(
@@ -663,6 +642,11 @@ class XgetHFDownloader:
                     "downloaded": performed_download,
                     "url_type": url_type,
                 }
+
+            if attempt >= max_attempts:
+                # 下载失败
+                print(f"🚫 达到最大重试次数，放弃下载: {local_path.name}")
+                return {"success": False, "downloaded": False, "url_type": url_type}
 
             attempt += 1
             attempt_note = f"{attempt}/{max_attempts}次尝试"
@@ -959,7 +943,8 @@ def main():
     download_parser.add_argument("--exclude", nargs="*", help="排除的文件模式")
     download_parser.add_argument(
         "--hf-mirror-url",
-        default="https://hf-mirror.com",
+        default="https://xget.xi-xu.me/hf",
+        # default="https://hf-mirror.com",
         help="HF 镜像URL，用于普通文件 (默认: https://hf-mirror.com)",
     )
     download_parser.add_argument(
