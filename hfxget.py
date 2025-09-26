@@ -75,20 +75,6 @@ def _aria2_release_position(position):
         _aria2_active_positions.discard(position)
 
 
-_UNIT_MULTIPLIERS = {
-    "B": 1,
-    "KiB": 1024,
-    "MiB": 1024**2,
-    "GiB": 1024**3,
-    "TiB": 1024**4,
-}
-
-
-def _unit_to_bytes(value, unit):
-    multiplier = _UNIT_MULTIPLIERS.get(unit, 1)
-    return int(float(value) * multiplier)
-
-
 def build_default_hf_headers(additional=None):
     base_headers = {
         "Accept": "*/*",
