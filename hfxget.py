@@ -652,7 +652,7 @@ class HFDownloader:
         return file_info.get("blob_id")
 
     def verify_file_integrity(
-        self, local_dir, file_path, file_info, force_regenerate_etag=False
+        self, local_dir, file_path: Path, file_info, force_regenerate_etag=False
     ):
         """通过元数据验证文件完整性。"""
 
@@ -1079,13 +1079,13 @@ def main():
     download_parser.add_argument("--include", nargs="*", help="包含的文件模式")
     download_parser.add_argument("--exclude", nargs="*", help="排除的文件模式")
     download_parser.add_argument(
-        "--hf-mirror-url",
+        "--hf-url",
         default="https://xget.xi-xu.me/hf",
         # default="https://hf-mirror.com",
         help="HF 镜像URL，用于普通文件 (默认: https://hf-mirror.com)",
     )
     download_parser.add_argument(
-        "--xget-url",
+        "--lfs-url",
         default="https://xget.xi-xu.me/hf",
         help="Xget 基础URL，用于 LFS 文件 (默认: https://xget.xi-xu.me/hf)",
     )
@@ -1110,7 +1110,7 @@ def main():
 
         try:
             downloader = HFDownloader(
-                args.xget_url, args.hf_mirror_url, args.downloader
+                args.lfs_url, args.hf_url, args.downloader
             )
         except Exception as e:
             print(f"❌ 初始化下载器失败: {e}")
