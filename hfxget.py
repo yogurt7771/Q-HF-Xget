@@ -720,6 +720,7 @@ class XgetHFDownloader:
     ):
         """下载整个仓库"""
         # 验证仓库ID
+        print(f"🔍 验证仓库: {repo_type} {repo_id} @ {revision}")
         try:
             self.hf_api.repo_info(repo_id, repo_type=repo_type, revision=revision)
         except Exception as e:
