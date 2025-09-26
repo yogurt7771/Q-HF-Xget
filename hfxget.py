@@ -11,9 +11,12 @@ Xget Hugging Face 下载加速器
 """
 
 import argparse
+import atexit
 import re
+import secrets
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -23,21 +26,27 @@ from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+import requests
+import urllib3
 
 try:
-    import requests
-    import urllib3
+    import aria2p
 
-    REQUESTS_AVAILABLE = True
+    ARIA2P_AVAILABLE = True
 except ImportError:
-    REQUESTS_AVAILABLE = False
+    aria2p = None
+    ARIA2P_AVAILABLE = False
 
 from huggingface_hub import HfApi
+from huggingface_hub._local_folder import (
+    read_download_metadata as hf_read_download_metadata,
+)
+from huggingface_hub._local_folder import (
+    write_download_metadata as hf_write_download_metadata,
+)
 from huggingface_hub.file_download import hf_hub_url
 from huggingface_hub.utils import build_hf_headers
-from huggingface_hub.utils.sha import sha_fileobj, git_hash
-from huggingface_hub._local_folder import read_download_metadata as hf_read_download_metadata
-from huggingface_hub._local_folder import write_download_metadata as hf_write_download_metadata
+from huggingface_hub.utils.sha import git_hash, sha_fileobj
 from tqdm import tqdm
 
 # 全局变量用于跟踪中断状态
@@ -69,9 +78,9 @@ def _aria2_release_position(position):
 _UNIT_MULTIPLIERS = {
     "B": 1,
     "KiB": 1024,
-    "MiB": 1024 ** 2,
-    "GiB": 1024 ** 3,
-    "TiB": 1024 ** 4,
+    "MiB": 1024**2,
+    "GiB": 1024**3,
+    "TiB": 1024**4,
 }
 
 
@@ -121,7 +130,9 @@ class DownloaderInterface(ABC):
     """下载器抽象接口"""
 
     @abstractmethod
-    def download_file(self, url: str, local_path: str, resume: bool = True) -> DownloadResult:
+    def download_file(
+        self, url: str, local_path: str, resume: bool = True
+    ) -> DownloadResult:
         """下载单个文件"""
         pass
 
@@ -142,9 +153,6 @@ class RequestsDownloader(DownloaderInterface):
 
     def download_file(self, url, local_path, resume=True):
         """使用 requests 下载文件"""
-        if not REQUESTS_AVAILABLE:
-            raise ImportError("requests 库未安装，请运行: pip install requests")
-
         local_path = Path(local_path)
         local_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -220,13 +228,15 @@ class RequestsDownloader(DownloaderInterface):
 
         except Exception as e:
             if (
-                hasattr(e, 'response')
+                hasattr(e, "response")
                 and e.response is not None
                 and e.response.status_code in [401, 403, 404]
             ):
                 print(f"🚫 HTTP {e.response.status_code}: {local_path.name}")
                 temp_path.unlink(missing_ok=True)
-                return DownloadResult(success=False, status_code=e.response.status_code, message=str(e))
+                return DownloadResult(
+                    success=False, status_code=e.response.status_code, message=str(e)
+                )
             else:
                 print(f"❌ 下载失败: {local_path.name}")
             print(f"原因: {str(e)}")
@@ -234,9 +244,12 @@ class RequestsDownloader(DownloaderInterface):
 
 
 class Aria2Downloader(DownloaderInterface):
-    """基于 aria2c 的下载器"""
+    """基于 aria2p 控制 aria2 RPC 的下载器"""
 
     def __init__(self):
+        if not ARIA2P_AVAILABLE:
+            raise EnvironmentError("aria2p 未安装，请运行: pip install aria2p")
+
         self.aria2_path = shutil.which("aria2c")
 
         if not self.aria2_path and sys.platform == "win32":
@@ -252,21 +265,147 @@ class Aria2Downloader(DownloaderInterface):
         if not self.aria2_path:
             raise EnvironmentError("未检测到 aria2c，请先安装 aria2 下载器")
 
-        self.progress_pattern = re.compile(
-            r"\[#\S+\s+([\d\.]+)([KMGTP]?i?B)/([\d\.]+)([KMGTP]?i?B)\((\d+)%\)\s+CN:(\d+)\s+DL:([\d\.]+)([KMGTP]?i?B)\s+ETA:([^\]]+)\]"
+        self.http_error_pattern = re.compile(
+            r"status(?:\\scode)?[:=]\s*(\\d{3})", re.IGNORECASE
         )
-        self.http_error_pattern = re.compile(r"status=(\d{3})")
         self.default_headers = build_default_hf_headers()
+
+        self.rpc_secret = secrets.token_hex(16)
+        self.rpc_port = self._find_free_port()
+        self._aria2_process = self._start_daemon()
+
+        self._client = aria2p.Client(
+            host="http://127.0.0.1", port=self.rpc_port, secret=self.rpc_secret
+        )
+        self._api = aria2p.API(self._client)
+        self._api_lock = threading.Lock()
+        self._ensure_daemon_ready()
+        atexit.register(self.shutdown)
 
     def get_name(self):
         return "aria2"
+
+    @staticmethod
+    def _format_speed(speed):
+        if not speed or speed <= 0:
+            return "0B/s"
+        units = ["B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s"]
+        value = float(speed)
+        for unit in units:
+            if value < 1024 or unit == units[-1]:
+                return f"{value:.1f}{unit}"
+            value /= 1024
+        return f"{value:.1f}PiB/s"
+
+    @staticmethod
+    def _format_eta(total, completed, speed):
+        if not speed or speed <= 0:
+            return "--"
+        remaining = max(total - completed, 0)
+        seconds = int(remaining / speed) if speed else 0
+        if seconds < 0:
+            seconds = 0
+        try:
+            return tqdm.format_interval(seconds)
+        except AttributeError:
+            from tqdm.utils import format_interval
+
+            return format_interval(seconds)
+
+    def _parse_http_status(self, message):
+        if not message:
+            return None
+        match = self.http_error_pattern.search(message)
+        if match:
+            return int(match.group(1))
+        return None
+
+    def _find_free_port(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return sock.getsockname()[1]
+
+    def _start_daemon(self):
+        args = [
+            self.aria2_path,
+            "--enable-rpc=true",
+            "--rpc-listen-all=false",
+            f"--rpc-listen-port={self.rpc_port}",
+            f"--rpc-secret={self.rpc_secret}",
+            "--rpc-allow-origin-all=true",
+            "--max-connection-per-server=4",
+            "--min-split-size=1M",
+            "--continue=true",
+            "--max-tries=5",
+            "--retry-wait=10",
+            "--auto-file-renaming=false",
+            "--console-log-level=warn",
+        ]
+        try:
+            return subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            raise EnvironmentError(f"启动 aria2c 失败: {exc}") from exc
+
+    def _ensure_daemon_ready(self, timeout=10.0):
+        start = time.time()
+        last_error = None
+        while time.time() - start < timeout:
+            if self._aria2_process.poll() is not None:
+                raise EnvironmentError("aria2c 进程提前退出，请检查安装和配置")
+            try:
+                with self._api_lock:
+                    self._client.get_version()
+                return
+            except Exception as exc:
+                last_error = exc
+                time.sleep(0.2)
+        raise EnvironmentError(f"aria2c RPC 未就绪: {last_error}")
+
+    def shutdown(self):
+        process = getattr(self, "_aria2_process", None)
+        if not process:
+            return
+        if process.poll() is None:
+            try:
+                with self._api_lock:
+                    try:
+                        downloads = self._api.get_downloads()
+                        for download in downloads:
+                            if download.status in ("active", "waiting", "paused"):
+                                self._api.remove(download, force=True, files=False)
+                    except Exception:
+                        pass
+                    try:
+                        self._api.force_shutdown()
+                    except Exception:
+                        self._api.shutdown()
+            except Exception:
+                pass
+            try:
+                process.terminate()
+            except Exception:
+                pass
+            try:
+                process.wait(timeout=3)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+        self._aria2_process = None
 
     def download_file(self, url, local_path, resume=True):
         local_path = Path(local_path)
         local_path.parent.mkdir(parents=True, exist_ok=True)
 
         control_file = Path(str(local_path) + ".aria2")
-        fresh_download = not resume or (local_path.exists() and not control_file.exists())
+        fresh_download = not resume or (
+            local_path.exists() and not control_file.exists()
+        )
 
         if fresh_download and local_path.exists():
             tqdm.write(f"♻️  覆盖现有文件: {local_path.name}")
@@ -282,33 +421,26 @@ class Aria2Downloader(DownloaderInterface):
             except OSError:
                 pass
 
-        aria_args = [
-            self.aria2_path,
-            "--continue=true",
-            "--auto-file-renaming=false",
-            "--summary-interval=1",
-            "--console-log-level=notice",
-            "--show-console-readout=true",
-            "--download-result=hide",
-            "--max-tries=5",
-            "--retry-wait=10",
-            "--max-connection-per-server=8",
-            "--min-split-size=1M",
-            "--enable-mmap=true",
-            "--disk-cache=64M",
-            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            f"--dir={local_path.parent}",
-            f"--out={local_path.name}",
-        ]
+        if self._aria2_process.poll() is not None:
+            raise EnvironmentError("aria2c 进程不可用，请重试或检查安装")
 
-        aria_args.append(
-            "--allow-overwrite=true" if fresh_download else "--allow-overwrite=false"
-        )
+        headers = [f"{key}: {value}" for key, value in self.default_headers.items()]
+        options = {
+            "dir": str(local_path.parent),
+            "out": local_path.name,
+            "continue": "true",
+            "allow-overwrite": "true" if fresh_download else "false",
+            "auto-file-renaming": "false",
+            "max-connection-per-server": "8",
+            "min-split-size": "1M",
+            "max-tries": "5",
+            "retry-wait": "10",
+            "header": headers,
+        }
 
-        for header_key, header_value in self.default_headers.items():
-            aria_args.append(f"--header={header_key}: {header_value}")
-
-        aria_args.append(url)
+        user_agent = self.default_headers.get("user-agent")
+        if user_agent:
+            options["user-agent"] = user_agent
 
         position = _aria2_acquire_position()
         progress_bar = tqdm(
@@ -321,98 +453,96 @@ class Aria2Downloader(DownloaderInterface):
             position=position,
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
         )
-        progress_total = None
 
-        http_status_code = None
-        last_error_message = None
-
+        download = None
         try:
-            process = subprocess.Popen(
-                aria_args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
+            try:
+                with self._api_lock:
+                    download = self._api.add_uris([url], options=options)
+            except Exception as exc:
+                tqdm.write(f"❌ 启动 aria2 任务失败: {local_path.name} | {exc}")
+                return DownloadResult(success=False, message=str(exc))
 
-            if process.stdout is not None:
-                for raw_line in iter(process.stdout.readline, ""):
-                    if interrupted:
-                        process.terminate()
-                        break
-                    line = raw_line.strip()
-                    if not line:
-                        continue
+            while True:
+                if interrupted:
+                    try:
+                        with self._api_lock:
+                            if download is not None:
+                                self._api.pause(download.gid)
+                    except Exception:
+                        pass
+                    tqdm.write(f"⏹️  手动中断 aria2 任务: {local_path.name}")
+                    return DownloadResult(success=False, message="interrupted")
 
-                    match = self.progress_pattern.search(line)
-                    if match:
-                        current = _unit_to_bytes(match.group(1), match.group(2))
-                        total = _unit_to_bytes(match.group(3), match.group(4))
-                        connections = match.group(6)
-                        speed_value = match.group(7)
-                        speed_unit = match.group(8)
-                        eta = match.group(9)
+                try:
+                    with self._api_lock:
+                        current_download = self._api.get_download(download.gid)
+                except Exception as exc:
+                    tqdm.write(f"❌ 无法获取 aria2 状态: {local_path.name} | {exc}")
+                    return DownloadResult(success=False, message=str(exc))
 
-                        if progress_total != total and total > 0:
-                            progress_total = total
-                            progress_bar.total = total
-                        delta = current - progress_bar.n
-                        if delta < 0:
-                            progress_bar.n = current
-                            progress_bar.refresh()
-                        elif delta:
-                            progress_bar.update(delta)
-                        progress_bar.set_postfix_str(
-                            f"CN:{connections} DL:{speed_value}{speed_unit} ETA:{eta.strip()}"
-                        )
-                        progress_bar.refresh()
-                        continue
+                total = int(current_download.total_length or 0)
+                completed = int(current_download.completed_length or 0)
+                speed = int(current_download.download_speed or 0)
+                connections = current_download.connections or 0
 
-                    if line.startswith("FILE:"):
-                        progress_bar.set_description(f"{local_path.name}")
-                        continue
+                if total > 0 and progress_bar.total != total:
+                    progress_bar.total = total
 
-                    status_match = self.http_error_pattern.search(line)
-                    if status_match:
-                        http_status_code = int(status_match.group(1))
+                delta = completed - progress_bar.n
+                if delta < 0:
+                    progress_bar.reset(total=progress_bar.total)
+                    progress_bar.update(completed)
+                elif delta:
+                    progress_bar.update(delta)
 
-                    last_error_message = line
-                    tqdm.write(f"aria2[{local_path.name}] ➜ {line}")
-                process.stdout.close()
+                eta_str = self._format_eta(total, completed, speed)
+                progress_bar.set_postfix_str(
+                    f"CN:{connections} DL:{self._format_speed(speed)} ETA:{eta_str}"
+                )
+                progress_bar.refresh()
 
-            return_code = process.wait()
+                status = current_download.status
+                if status == "complete":
+                    return DownloadResult(success=True)
+                if status == "error":
+                    status_code = self._parse_http_status(
+                        current_download.error_message
+                    )
+                    message = (
+                        current_download.error_message
+                        or f"aria2 错误码 {current_download.error_code}"
+                    )
+                    tqdm.write(f"❌ aria2 下载失败: {local_path.name} | {message}")
+                    return DownloadResult(
+                        success=False, status_code=status_code, message=message
+                    )
+                if status == "removed":
+                    tqdm.write(f"❌ aria2 任务被移除: {local_path.name}")
+                    return DownloadResult(success=False, message="removed")
 
-            if return_code == 0 and not interrupted:
-                return DownloadResult(success=True)
-
-            if interrupted:
-                tqdm.write(f"⏹️  手动中断 aria2 进程: {local_path.name}")
-                return DownloadResult(success=False, message="interrupted")
-
-            tqdm.write(f"❌ aria2 下载失败: {local_path.name} (退出码 {return_code})")
-            return DownloadResult(success=False, status_code=http_status_code, message=last_error_message)
-
-        except FileNotFoundError:
-            tqdm.write("❌ 未找到 aria2c 可执行文件，请确认已安装并在 PATH 中")
-            return DownloadResult(success=False, message="aria2c not found")
-        except Exception as exc:
-            tqdm.write(f"❌ aria2 下载异常: {local_path.name} | {exc}")
-            return DownloadResult(success=False, message=str(exc))
+                time.sleep(0.3)
         finally:
             progress_bar.close()
             _aria2_release_position(position)
+            if download is not None:
+                try:
+                    with self._api_lock:
+                        self._api.remove_download_result(download)
+                except Exception:
+                    pass
 
 
-class XgetHFDownloader:
+class HFDownloader:
     def __init__(
         self,
-        xget_base_url="https://xget.xi-xu.me/hf",
-        hf_mirror_url="https://hf-mirror.com",
+        lfs_base_url="https://xget.xi-xu.me/hf",
+        hf_base_url="https://hf-mirror.com",
         downloader_type="requests",
     ):
-        self.xget_base_url = xget_base_url
-        self.hf_mirror_url = hf_mirror_url
-        self.hf_api = HfApi(endpoint=hf_mirror_url)
+        self.lfs_base_url = lfs_base_url
+        self.hf_base_url = hf_base_url
+        self.hf_api = HfApi(endpoint=hf_base_url)
 
         # LFS 文件大小阈值 (50MB)
         self.lfs_size_threshold = 50 * 1024 * 1024
@@ -430,15 +560,13 @@ class XgetHFDownloader:
             raise ValueError(f"不支持的下载器类型: {downloader_type}")
 
         print(f"🛠️  下载核心: {self.downloader.get_name()}")
-        print(f"🪞  HF 镜像: {self.hf_mirror_url}")
-        print(f"🚀  Xget 加速: {self.xget_base_url}")
+        print(f"🪞  HF 镜像: {self.hf_base_url}")
+        print(f"🚀  LFS 加速: {self.lfs_base_url}")
 
     def get_repo_file_list(self, repo_id, repo_type="model", revision="main"):
         """获取仓库文件列表和详细信息"""
         try:
-            print(
-                f"📡 获取文件列表: {repo_type} {repo_id} @ {revision}"
-            )
+            print(f"📡 获取文件列表: {repo_type} {repo_id} @ {revision}")
 
             repo_info = self.hf_api.repo_info(
                 repo_id, repo_type=repo_type, revision=revision, files_metadata=True
@@ -486,7 +614,7 @@ class XgetHFDownloader:
         url_filename = filename.replace("\\", "/")
 
         if is_lfs:
-            # LFS 文件使用 Xget
+            # LFS 文件使用 LFS 地址
             if repo_type == "dataset":
                 hf_url = f"https://huggingface.co/datasets/{repo_id}/resolve/{revision}/{url_filename}?download=true"
             elif repo_type == "space":
@@ -494,8 +622,8 @@ class XgetHFDownloader:
             else:  # model
                 hf_url = f"https://huggingface.co/{repo_id}/resolve/{revision}/{url_filename}?download=true"
 
-            download_url = hf_url.replace("https://huggingface.co", self.xget_base_url)
-            url_type = "Xget"
+            download_url = hf_url.replace("https://huggingface.co", self.lfs_base_url)
+            url_type = "LFS"
         else:
             # 普通文件使用 hf-mirror
             # download_url = None
@@ -504,9 +632,9 @@ class XgetHFDownloader:
                 filename,
                 repo_type=repo_type,
                 revision=revision,
-                endpoint=self.hf_mirror_url,
+                endpoint=self.hf_base_url,
             )
-            url_type = "hf-mirror"
+            url_type = "HF"
 
         hf_mirror_param = {
             "repo_id": repo_id,
@@ -537,7 +665,9 @@ class XgetHFDownloader:
 
         return file_info.get("blob_id")
 
-    def verify_file_integrity(self, local_dir, file_path, file_info):
+    def verify_file_integrity(
+        self, local_dir, file_path, file_info, force_regenerate_etag=False
+    ):
         """通过元数据验证文件完整性。"""
 
         if not file_path.exists():
@@ -554,6 +684,10 @@ class XgetHFDownloader:
 
         metadata = None
         filename = file_info.get("filename")
+
+        if force_regenerate_etag:
+            self._write_local_metadata(local_dir, file_info)
+
         try:
             metadata = hf_read_download_metadata(Path(local_dir), filename)
         except Exception as e:
@@ -628,7 +762,12 @@ class XgetHFDownloader:
                 print(f"⏹️  下载被中断，跳过: {local_path.name}")
                 return {"success": False, "downloaded": False, "url_type": url_type}
 
-            if self.verify_file_integrity(local_dir, local_path, file_info):
+            if self.verify_file_integrity(
+                local_dir,
+                local_path,
+                file_info,
+                force_regenerate_etag=performed_download,
+            ):
                 print(f"✅ 已存在且通过校验: {local_path.name}")
                 return {
                     "success": True,
@@ -643,12 +782,10 @@ class XgetHFDownloader:
 
             attempt += 1
             attempt_note = f"{attempt}/{max_attempts}次尝试"
-            print(
-                f"📥 开始下载: {local_path.name} | 来源: {url_type} | {attempt_note}"
-            )
+            print(f"📥 开始下载: {local_path.name} | 来源: {url_type} | {attempt_note}")
             final_source = url_type
 
-            if url_type in ["Xget", "HfMirror"]:
+            if url_type in ["LFS"]:
                 try:
                     download_result = self.downloader.download_file(url, local_path)
                     performed_download = True
@@ -658,36 +795,48 @@ class XgetHFDownloader:
                     else:
                         status_code = download_result.status_code
                         if status_code in {401, 403, 404}:
-                            print(f"🔀 Xget 下载错误：{status_code=}, 尝试切换 hf-mirror: {local_path.name}")
+                            print(
+                                f"🔀 LFS 下载错误：{status_code=}, 尝试切换 HF 下载: {local_path.name}"
+                            )
                             local_path.unlink(missing_ok=True)
                             control_file = Path(str(local_path) + ".aria2")
                             control_file.unlink(missing_ok=True)
-                            url_type = "hf-mirror"
+                            url_type = "HF"
                         else:
                             message = download_result.message
                             if message:
-                                print(f"⚠️ Xget 下载未完成: {local_path.name} | {message}")
+                                print(
+                                    f"⚠️ LFS 下载未完成: {local_path.name} | {message}"
+                                )
                             else:
-                                print(f"⚠️ Xget 下载未完成: {local_path.name}")
+                                print(f"⚠️ LFS 下载未完成: {local_path.name}")
                 except Exception as e:
                     performed_download = True
-                    print(f"❌ Xget 下载异常: {local_path.name} | {e}")
+                    print(f"❌ LFS 下载异常: {local_path.name} | {e}")
                     print(traceback.format_exc())
-            elif url_type in ["hf-mirror"]:
+            elif url_type in ["HF"]:
                 try:
-                    self.hf_api.hf_hub_download(**hf_mirror_param, local_dir=local_dir, resume_download=True)
+                    self.hf_api.hf_hub_download(
+                        **hf_mirror_param, local_dir=local_dir, resume_download=True
+                    )
                     download_success = True
                     performed_download = True
                 except Exception as e:
                     performed_download = True
-                    if hasattr(e, "response") and e.response is not None and e.response.status_code in [401, 403, 404]:
-                        print(f"🚫 HF 镜像访问受限 ({e.response.status_code}): {local_path.name} | {e}")
+                    if (
+                        hasattr(e, "response")
+                        and e.response is not None
+                        and e.response.status_code in [401, 403, 404]
+                    ):
+                        print(
+                            f"🚫 HF 访问受限 ({e.response.status_code}): {local_path.name} | {e}"
+                        )
                         return {
                             "success": False,
                             "downloaded": performed_download,
                             "url_type": url_type,
                         }
-                    print(f"❌ 镜像下载异常: {local_path.name} | {e}")
+                    print(f"❌ HF下载异常: {local_path.name} | {e}")
             else:
                 print(f"❌ 未知下载类型: {url_type} | {local_path.name}")
                 return {"success": False, "downloaded": False, "url_type": url_type}
@@ -695,11 +844,17 @@ class XgetHFDownloader:
             if not download_success:
                 if attempt < max_attempts:
                     wait_seconds = 2
-                    print(f"🔁 准备重试: {local_path.name} | 下一次尝试 {attempt + 1}/{max_attempts} | 等待 {wait_seconds}s")
+                    print(
+                        f"🔁 准备重试: {local_path.name} | 下一次尝试 {attempt + 1}/{max_attempts} | 等待 {wait_seconds}s"
+                    )
                     time.sleep(wait_seconds)
                     continue
                 print(f"🚫 放弃下载: {local_path.name} | 已达最大重试次数")
-                return {"success": False, "downloaded": performed_download, "url_type": final_source}
+                return {
+                    "success": False,
+                    "downloaded": performed_download,
+                    "url_type": final_source,
+                }
 
             if download_success:
                 if local_path.exists():
@@ -764,7 +919,7 @@ class XgetHFDownloader:
 
         total_files = len(files_info)
         print(
-            f"📂 文件统计: 共 {total_files} 个 | LFS (Xget): {len(lfs_files)} | 普通 (hf-mirror): {len(regular_files)}"
+            f"📂 文件统计: 共 {total_files} 个 | LFS: {len(lfs_files)} | 普通 (hf-mirror): {len(regular_files)}"
         )
 
         files_to_download = []
@@ -777,7 +932,7 @@ class XgetHFDownloader:
             url, url_type, hf_mirror_param = self.build_download_url(
                 repo_id, filename, repo_type, revision, is_lfs
             )
-            source_icon = "🔗" if url_type == "Xget" else "🪞"
+            source_icon = "🔗" if url_type == "LFS" else "🪞"
             print(f"{source_icon} 排队: {filename}")
             files_to_download.append(
                 (url, local_path, file_info, url_type, hf_mirror_param)
@@ -796,8 +951,8 @@ class XgetHFDownloader:
         failed_downloads = 0
         total_bytes_downloaded = 0
         start_time = time.time()
-        xget_downloads = 0
-        mirror_downloads = 0
+        lfs_downloads = 0
+        hf_downloads = 0
         verified_without_downloads = 0
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -830,18 +985,22 @@ class XgetHFDownloader:
                         break
 
                     try:
-                        url, local_path, file_info, url_type, hf_mirror_param = future_to_task[future]
+                        url, local_path, file_info, url_type, hf_mirror_param = (
+                            future_to_task[future]
+                        )
                         result = future.result()
                         if isinstance(result, dict):
                             if result.get("success"):
                                 successful_downloads += 1
                                 if result.get("downloaded"):
-                                    if result.get("url_type") == "Xget":
-                                        xget_downloads += 1
+                                    if result.get("url_type") == "LFS":
+                                        lfs_downloads += 1
                                     else:
-                                        mirror_downloads += 1
+                                        hf_downloads += 1
                                     if local_path.exists():
-                                        total_bytes_downloaded += local_path.stat().st_size
+                                        total_bytes_downloaded += (
+                                            local_path.stat().st_size
+                                        )
                                 else:
                                     verified_without_downloads += 1
                             else:
@@ -849,10 +1008,10 @@ class XgetHFDownloader:
                                 print(f"❌ 任务失败: {file_info['filename']}")
                         elif result:
                             successful_downloads += 1
-                            if url_type == "Xget":
-                                xget_downloads += 1
+                            if url_type == "LFS":
+                                lfs_downloads += 1
                             else:
-                                mirror_downloads += 1
+                                hf_downloads += 1
                             if local_path.exists():
                                 total_bytes_downloaded += local_path.stat().st_size
                         else:
@@ -883,8 +1042,8 @@ class XgetHFDownloader:
         print(f"\n📊 下载统计:")
         print(f"  ✅ 成功: {successful_downloads}")
         print(f"    🔄 已存在验证: {verified_without_downloads}")
-        print(f"    🔗 Xget下载: {xget_downloads}")
-        print(f"    🪞 镜像下载: {mirror_downloads}")
+        print(f"    🔗 Xget下载: {lfs_downloads}")
+        print(f"    🪞 镜像下载: {hf_downloads}")
         print(f"  ❌ 失败: {failed_downloads}")
         print(f"  📁 总计: {len(files_to_download)}")
         print(f"  💾 下载量: {total_bytes_downloaded / (1024*1024*1024):.2f} GB")
@@ -897,14 +1056,14 @@ class XgetHFDownloader:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Xget Hugging Face 下载加速器（无Git依赖版本）",
+        description="Hugging Face 下载加速器",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:
-  python xget_hf.py download microsoft/DialoGPT-medium --local-dir ./model
-  python xget_hf.py download squad --repo-type dataset --local-dir ./data
-  python xget_hf.py download microsoft/DialoGPT-medium --max-workers 8 --downloader requests
-  python xget_hf.py download bigscience/bloom --downloader aria2
+  python hfxget.py download microsoft/DialoGPT-medium --local-dir ./model
+  python hfxget.py download squad --repo-type dataset --local-dir ./data
+  python hfxget.py download microsoft/DialoGPT-medium --max-workers 8 --downloader requests
+  python hfxget.py download bigscience/bloom --downloader aria2
 
 下载策略:
   1. 使用 HF API 获取完整文件列表和信息
@@ -959,12 +1118,12 @@ def main():
 
     if args.command == "download":
         # 检查下载器可用性
-        if args.downloader == "requests" and not REQUESTS_AVAILABLE:
-            print("❌ requests 库未安装，请运行: pip install requests")
+        if args.downloader == "aria2" and not ARIA2P_AVAILABLE:
+            print("❌ aria2p 库未安装，请运行: pip install aria2p")
             return 1
 
         try:
-            downloader = XgetHFDownloader(
+            downloader = HFDownloader(
                 args.xget_url, args.hf_mirror_url, args.downloader
             )
         except Exception as e:
