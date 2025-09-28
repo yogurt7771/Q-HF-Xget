@@ -2,12 +2,6 @@
 """
 Xget Hugging Face 下载加速器
 用于替代 hf download 命令，通过 Xget 加速下载，避免网络问题
-
-策略：
-1. 使用 HF API 获取完整文件列表
-2. 小文件从 hf-mirror.com 下载
-3. LFS 文件从 Xget 下载
-4. 验证文件完整性
 """
 
 import argparse
@@ -28,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import requests
 import urllib3
+from urllib.error import HTTPError, URLError
 
 try:
     import aria2p
@@ -36,6 +31,22 @@ try:
 except ImportError:
     aria2p = None
     ARIA2P_AVAILABLE = False
+
+try:
+    import wget
+
+    WGET_AVAILABLE = True
+except ImportError:
+    wget = None
+    WGET_AVAILABLE = False
+
+try:
+    import pycurl
+
+    PYCURL_AVAILABLE = True
+except ImportError:
+    pycurl = None
+    PYCURL_AVAILABLE = False
 
 from huggingface_hub import HfApi
 from huggingface_hub._local_folder import (
@@ -75,21 +86,11 @@ def _aria2_release_position(position):
         _aria2_active_positions.discard(position)
 
 
-def build_default_hf_headers(additional=None):
-    base_headers = {
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-    }
-    if additional:
-        base_headers.update(additional)
-
+def build_default_hf_headers():
     return build_hf_headers(
-        token=False,
+        token=True,
         library_name=APP_NAME,
         library_version=APP_VERSION,
-        headers=base_headers,
     )
 
 
@@ -227,6 +228,272 @@ class RequestsDownloader(DownloaderInterface):
                 print(f"❌ 下载失败: {local_path.name}")
             print(f"原因: {str(e)}")
             return DownloadResult(success=False, message=str(e))
+
+
+class WgetDownloader(DownloaderInterface):
+    """基于 wget 库的下载器"""
+
+    def __init__(self):
+        if not WGET_AVAILABLE:
+            raise EnvironmentError("wget 库未安装，请运行: pip install wget")
+
+        self.default_headers = build_default_hf_headers()
+        self.user_agent = self.default_headers.get("user-agent")
+        if self.user_agent:
+            try:
+                wget.user_agent = self.user_agent
+            except Exception:
+                pass
+
+    def get_name(self):
+        return "wget"
+
+    def download_file(self, url, local_path, resume=True):
+        local_path = Path(local_path)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+
+        temp_path = local_path
+        if resume:
+            temp_path = local_path.with_suffix(local_path.suffix + ".incomplete")
+            if temp_path.exists():
+                print(f"⚠️ wget 下载器暂不支持断点续传，重新开始: {local_path.name}")
+                temp_path.unlink()
+        else:
+            if local_path.exists():
+                print(f"♻️  覆盖现有文件: {local_path.name}")
+                local_path.unlink()
+
+        progress_bar = None
+
+        def tqdm_bar(downloaded, total, width=80):
+            nonlocal progress_bar
+            if interrupted:
+                raise KeyboardInterrupt("interrupted")
+
+            total_value = total if total and total > 0 else None
+
+            if progress_bar is None:
+                initial = downloaded if total_value is not None else 0
+                progress_bar = tqdm(
+                    desc=local_path.name,
+                    total=total_value,
+                    initial=initial,
+                    unit="B",
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    leave=False,
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+                )
+            else:
+                if total_value is not None and progress_bar.total != total_value:
+                    progress_bar.total = total_value
+                delta = downloaded - progress_bar.n
+                if delta > 0:
+                    progress_bar.update(delta)
+            return ""
+
+        try:
+            result_path = wget.download(url, out=str(temp_path), bar=tqdm_bar)
+
+            if progress_bar is not None and progress_bar.total is not None:
+                remaining = progress_bar.total - progress_bar.n
+                if remaining > 0:
+                    progress_bar.update(remaining)
+
+            result_path = Path(result_path or temp_path)
+
+            if temp_path != local_path:
+                local_path.unlink(missing_ok=True)
+                result_path.replace(local_path)
+
+            return DownloadResult(success=True)
+
+        except HTTPError as e:
+            print(f"🚫 HTTP {e.code}: {local_path.name}")
+            temp_path.unlink(missing_ok=True)
+            return DownloadResult(success=False, status_code=getattr(e, 'code', None), message=str(e))
+        except URLError as e:
+            print(f"❌ 下载失败: {local_path.name}")
+            print(f"原因: {e.reason if hasattr(e, 'reason') else e}")
+            temp_path.unlink(missing_ok=True)
+            return DownloadResult(success=False, message=str(e))
+        except KeyboardInterrupt:
+            temp_path.unlink(missing_ok=True)
+            return DownloadResult(success=False, message="interrupted")
+        except Exception as e:
+            if not interrupted:
+                print(f"❌ 下载失败: {local_path.name}")
+                print(f"原因: {str(e)}")
+            temp_path.unlink(missing_ok=True)
+            return DownloadResult(success=False, message=str(e))
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
+
+
+class PycurlDownloader(DownloaderInterface):
+    """基于 pycurl 的下载器"""
+
+    def __init__(self):
+        if not PYCURL_AVAILABLE:
+            raise EnvironmentError("pycurl 库未安装，请运行: pip install pycurl")
+
+        self.default_headers = build_default_hf_headers()
+        self.connect_timeout = 30
+        self.read_timeout = 300
+
+    def get_name(self):
+        return "pycurl"
+
+    def download_file(self, url, local_path, resume=True):
+        local_path = Path(local_path)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+
+        temp_path = local_path
+        initial_pos = 0
+
+        if resume:
+            temp_path = local_path.with_suffix(local_path.suffix + ".incomplete")
+            if temp_path.exists():
+                initial_pos = temp_path.stat().st_size
+        else:
+            if local_path.exists():
+                print(f"♻️  覆盖现有文件: {local_path.name}")
+                local_path.unlink()
+
+        file_mode = "ab" if initial_pos > 0 else "wb"
+        progress_bar = None
+        curl = None
+        file_obj = None
+        should_remove_partial = False
+
+        def progress_callback(download_total, download_now, upload_total, upload_now):
+            nonlocal progress_bar
+            if interrupted:
+                return 1
+
+            total_value = download_total + initial_pos if download_total and download_total > 0 else None
+            current = download_now + initial_pos
+
+            if progress_bar is None:
+                progress_bar_local_total = total_value
+                progress_bar = tqdm(
+                    desc=local_path.name,
+                    total=progress_bar_local_total,
+                    initial=initial_pos,
+                    unit="B",
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    leave=False,
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+                )
+            else:
+                if total_value is not None and progress_bar.total != total_value:
+                    progress_bar.total = total_value
+
+            if progress_bar.total is not None and current > progress_bar.total:
+                current = progress_bar.total
+
+            delta = current - progress_bar.n
+            if delta < 0:
+                progress_bar.reset(total=progress_bar.total)
+                progress_bar.update(current)
+            elif delta > 0:
+                progress_bar.update(delta)
+
+            return 0
+
+        try:
+            file_obj = open(temp_path, file_mode)
+
+            curl = pycurl.Curl()
+            curl.setopt(pycurl.URL, url)
+            curl.setopt(pycurl.FOLLOWLOCATION, True)
+            curl.setopt(pycurl.MAXREDIRS, 5)
+            curl.setopt(pycurl.NOSIGNAL, True)
+            curl.setopt(pycurl.CONNECTTIMEOUT, self.connect_timeout)
+            curl.setopt(pycurl.TIMEOUT, self.read_timeout)
+            curl.setopt(pycurl.WRITEDATA, file_obj)
+            curl.setopt(pycurl.NOPROGRESS, False)
+
+            headers = []
+            user_agent = None
+            for key, value in self.default_headers.items():
+                if key.lower() == "user-agent":
+                    user_agent = value
+                else:
+                    headers.append(f"{key}: {value}")
+
+            if headers:
+                curl.setopt(pycurl.HTTPHEADER, headers)
+            if user_agent:
+                curl.setopt(pycurl.USERAGENT, user_agent)
+
+            if resume and initial_pos > 0:
+                curl.setopt(pycurl.RESUME_FROM, initial_pos)
+                file_obj.seek(initial_pos)
+            else:
+                file_obj.seek(0)
+
+            if hasattr(pycurl, "XFERINFOFUNCTION"):
+                curl.setopt(pycurl.XFERINFOFUNCTION, progress_callback)
+            else:
+                curl.setopt(pycurl.PROGRESSFUNCTION, progress_callback)
+
+            curl.perform()
+
+            status_code = int(curl.getinfo(pycurl.RESPONSE_CODE) or 0)
+            if status_code >= 400:
+                print(f"🚫 HTTP {status_code}: {local_path.name}")
+                should_remove_partial = True
+                return DownloadResult(success=False, status_code=status_code, message=f"HTTP {status_code}")
+
+            if progress_bar is not None and progress_bar.total is not None:
+                remaining = progress_bar.total - progress_bar.n
+                if remaining > 0:
+                    progress_bar.update(remaining)
+
+            if temp_path != local_path:
+                file_obj.flush()
+                file_obj.close()
+                file_obj = None
+                local_path.unlink(missing_ok=True)
+                temp_path.rename(local_path)
+
+            return DownloadResult(success=True)
+
+        except pycurl.error as e:
+            errno = e.args[0] if e.args else None
+            status_code = None
+            if curl is not None:
+                try:
+                    status_code = int(curl.getinfo(pycurl.RESPONSE_CODE) or 0)
+                except Exception:
+                    status_code = None
+            if errno == getattr(pycurl, "E_ABORTED_BY_CALLBACK", 42) or interrupted:
+                should_remove_partial = True
+                return DownloadResult(success=False, message="interrupted")
+            print(f"❌ 下载失败: {local_path.name}")
+            print(f"原因: {e.args[1] if len(e.args) > 1 else e}")
+            should_remove_partial = True
+            return DownloadResult(success=False, status_code=status_code, message=str(e))
+        except KeyboardInterrupt:
+            should_remove_partial = True
+            return DownloadResult(success=False, message="interrupted")
+        except Exception as e:
+            print(f"❌ 下载失败: {local_path.name}")
+            print(f"原因: {str(e)}")
+            should_remove_partial = True
+            return DownloadResult(success=False, message=str(e))
+        finally:
+            if file_obj is not None:
+                file_obj.close()
+            if curl is not None:
+                curl.close()
+            if progress_bar is not None:
+                progress_bar.close()
+            if should_remove_partial:
+                temp_path.unlink(missing_ok=True)
 
 
 class Aria2Downloader(DownloaderInterface):
@@ -523,8 +790,9 @@ class HFDownloader:
     def __init__(
         self,
         lfs_base_url="https://xget.xi-xu.me/hf",
-        hf_base_url="https://hf-mirror.com",
-        downloader_type="requests",
+        hf_base_url="https://xget.xi-xu.me/hf",
+        hf_downloader_type="pycurl",
+        lfs_downloader_type="pycurl",
     ):
         self.lfs_base_url = lfs_base_url
         self.hf_base_url = hf_base_url
@@ -537,17 +805,34 @@ class HFDownloader:
         self.resolved_commit_hash = None
 
         # 选择下载器
-        self.downloader: DownloaderInterface = None
-        if downloader_type == "requests":
-            self.downloader = RequestsDownloader()
-        elif downloader_type == "aria2":
-            self.downloader = Aria2Downloader()
+        self.hf_downloader: DownloaderInterface | None = None
+        if hf_downloader_type == "requests":
+            self.hf_downloader = RequestsDownloader()
+        elif hf_downloader_type == "wget":
+            self.hf_downloader = WgetDownloader()
+        elif hf_downloader_type == "pycurl":
+            self.hf_downloader = PycurlDownloader()
+        elif lfs_downloader_type == "aria2":
+            self.lfs_downloader = Aria2Downloader()
         else:
-            raise ValueError(f"不支持的下载器类型: {downloader_type}")
+            raise ValueError(f"不支持的下载器类型: {hf_downloader_type}")
 
-        print(f"🛠️  下载核心: {self.downloader.get_name()}")
-        print(f"🪞  HF 镜像: {self.hf_base_url}")
-        print(f"🚀  LFS 加速: {self.lfs_base_url}")
+        self.lfs_downloader: DownloaderInterface | None = None
+        if lfs_downloader_type == "requests":
+            self.lfs_downloader = RequestsDownloader()
+        elif lfs_downloader_type == "wget":
+            self.lfs_downloader = WgetDownloader()
+        elif lfs_downloader_type == "pycurl":
+            self.lfs_downloader = PycurlDownloader()
+        elif lfs_downloader_type == "aria2":
+            self.lfs_downloader = Aria2Downloader()
+        else:
+            raise ValueError(f"不支持的下载器类型: {lfs_downloader_type}")
+
+        print(f"🪞  HF 地址: {self.hf_base_url}")
+        print(f"🛠️  HF 下载核心: {self.hf_downloader.get_name()}")
+        print(f"🚀  LFS 地址: {self.lfs_base_url}")
+        print(f"🛠️  LFS 下载核心: {self.lfs_downloader.get_name()}")
 
     def get_repo_file_list(self, repo_id, repo_type="model", revision="main"):
         """获取仓库文件列表和详细信息"""
@@ -611,16 +896,24 @@ class HFDownloader:
             download_url = hf_url.replace("https://huggingface.co", self.lfs_base_url)
             url_type = "LFS"
         else:
-            # 普通文件使用 hf-mirror
-            # download_url = None
-            download_url = hf_hub_url(
-                repo_id,
-                filename,
-                repo_type=repo_type,
-                revision=revision,
-                endpoint=self.hf_base_url,
-            )
-            url_type = "HF"
+            # 普通文件
+            # download_url = hf_hub_url(
+            #     repo_id,
+            #     filename,
+            #     repo_type=repo_type,
+            #     revision=revision,
+            #     endpoint=self.hf_base_url,
+            # )
+            # url_type = "HF"
+            if repo_type == "dataset":
+                hf_url = f"https://huggingface.co/datasets/{repo_id}/resolve/{revision}/{url_filename}?download=true"
+            elif repo_type == "space":
+                hf_url = f"https://huggingface.co/spaces/{repo_id}/resolve/{revision}/{url_filename}?download=true"
+            else:  # model
+                hf_url = f"https://huggingface.co/{repo_id}/resolve/{revision}/{url_filename}?download=true"
+
+            download_url = hf_url.replace("https://huggingface.co", self.hf_base_url)
+            url_type = "HF-URL"
 
         hf_mirror_param = {
             "repo_id": repo_id,
@@ -636,18 +929,8 @@ class HFDownloader:
 
         lfs_info = file_info.get("lfs")
         if lfs_info is not None:
-            sha256 = getattr(lfs_info, "sha256", None)
-            if sha256 is None and isinstance(lfs_info, dict):
-                sha256 = lfs_info.get("sha256")
-            if sha256:
-                return sha256
-
-            oid = getattr(lfs_info, "oid", None)
-            if oid is None and isinstance(lfs_info, dict):
-                oid = lfs_info.get("oid")
-            if isinstance(oid, str) and oid.startswith("sha256:"):
-                return oid.split(":", 1)[1]
-            return oid
+            sha256 = lfs_info.get("sha256")
+            return sha256
 
         return file_info.get("blob_id")
 
@@ -760,6 +1043,8 @@ class HFDownloader:
                     "downloaded": performed_download,
                     "url_type": url_type,
                 }
+            else:
+                local_path.unlink(missing_ok=True)
 
             if attempt >= max_attempts:
                 # 下载失败
@@ -768,12 +1053,12 @@ class HFDownloader:
 
             attempt += 1
             attempt_note = f"{attempt}/{max_attempts}次尝试"
-            print(f"📥 开始下载: {local_path.name} | 来源: {url_type} | {attempt_note}")
+            print(f"📥 开始下载: {local_path.name} | 来源: {url_type} | {attempt_note} | URL: {url}")
             final_source = url_type
 
             if url_type in ["LFS"]:
                 try:
-                    download_result = self.downloader.download_file(url, local_path)
+                    download_result = self.lfs_downloader.download_file(url, local_path)
                     performed_download = True
 
                     if download_result.success:
@@ -796,6 +1081,35 @@ class HFDownloader:
                                 )
                             else:
                                 print(f"⚠️ LFS 下载未完成: {local_path.name}")
+                except Exception as e:
+                    performed_download = True
+                    print(f"❌ LFS 下载异常: {local_path.name} | {e}")
+                    print(traceback.format_exc())
+            elif url_type in ["HF-URL"]:
+                try:
+                    download_result = self.hf_downloader.download_file(url, local_path)
+                    performed_download = True
+
+                    if download_result.success:
+                        download_success = True
+                    else:
+                        status_code = download_result.status_code
+                        if status_code in {401, 403, 404}:
+                            print(
+                                f"🔀 HF-URL 下载错误：{status_code=}, 尝试切换 HF 下载: {local_path.name}"
+                            )
+                            local_path.unlink(missing_ok=True)
+                            control_file = Path(str(local_path) + ".aria2")
+                            control_file.unlink(missing_ok=True)
+                            url_type = "HF"
+                        else:
+                            message = download_result.message
+                            if message:
+                                print(
+                                    f"⚠️ HF-URL 下载未完成: {local_path.name} | {message}"
+                                )
+                            else:
+                                print(f"⚠️ HF-URL 下载未完成: {local_path.name}")
                 except Exception as e:
                     performed_download = True
                     print(f"❌ LFS 下载异常: {local_path.name} | {e}")
@@ -905,7 +1219,7 @@ class HFDownloader:
 
         total_files = len(files_info)
         print(
-            f"📂 文件统计: 共 {total_files} 个 | LFS: {len(lfs_files)} | 普通 (hf-mirror): {len(regular_files)}"
+            f"📂 文件统计: 共 {total_files} 个 | LFS: {len(lfs_files)} | 普通: {len(regular_files)}"
         )
 
         files_to_download = []
@@ -919,7 +1233,7 @@ class HFDownloader:
                 repo_id, filename, repo_type, revision, is_lfs
             )
             source_icon = "🔗" if url_type == "LFS" else "🪞"
-            print(f"{source_icon} 排队: {filename}")
+            print(f"{source_icon} 排队: {filename} | 来源: {url_type} | fileinfo: {file_info}")
             files_to_download.append(
                 (url, local_path, file_info, url_type, hf_mirror_param)
             )
@@ -1035,7 +1349,6 @@ class HFDownloader:
         print(f"  💾 下载量: {total_bytes_downloaded / (1024*1024*1024):.2f} GB")
         print(f"  ⏱️  用时: {total_time:.1f} 秒")
         print(f"  🚀 平均速度: {avg_speed / (1024*1024):.1f} MB/s")
-        print(f"  🔧 下载核心: {self.downloader.get_name()}")
 
         return failed_downloads == 0
 
@@ -1043,20 +1356,6 @@ class HFDownloader:
 def main():
     parser = argparse.ArgumentParser(
         description="Hugging Face 下载加速器",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-使用示例:
-  python hfxget.py download microsoft/DialoGPT-medium --local-dir ./model
-  python hfxget.py download squad --repo-type dataset --local-dir ./data
-  python hfxget.py download microsoft/DialoGPT-medium --max-workers 8 --downloader requests
-  python hfxget.py download bigscience/bloom --downloader aria2
-
-下载策略:
-  1. 使用 HF API 获取完整文件列表和信息
-  2. 小文件从 hf-mirror.com 快速下载
-  3. LFS 大文件从 Xget 加速下载
-  4. 验证文件完整性（文件大小验证）
-        """,
     )
 
     subparsers = parser.add_subparsers(dest="command", help="可用命令")
@@ -1081,8 +1380,7 @@ def main():
     download_parser.add_argument(
         "--hf-url",
         default="https://xget.xi-xu.me/hf",
-        # default="https://hf-mirror.com",
-        help="HF 镜像URL，用于普通文件 (默认: https://hf-mirror.com)",
+        help="HF 镜像URL，用于普通文件",
     )
     download_parser.add_argument(
         "--lfs-url",
@@ -1090,8 +1388,14 @@ def main():
         help="Xget 基础URL，用于 LFS 文件 (默认: https://xget.xi-xu.me/hf)",
     )
     download_parser.add_argument(
-        "--downloader",
-        choices=["requests", "aria2"],
+        "--hf-downloader",
+        choices=["requests", "aria2", "wget", "pycurl"],
+        default="requests",
+        help="下载核心",
+    )
+    download_parser.add_argument(
+        "--lfs-downloader",
+        choices=["requests", "aria2", "wget", "pycurl"],
         default="requests",
         help="下载核心",
     )
@@ -1103,14 +1407,9 @@ def main():
         return 1
 
     if args.command == "download":
-        # 检查下载器可用性
-        if args.downloader == "aria2" and not ARIA2P_AVAILABLE:
-            print("❌ aria2p 库未安装，请运行: pip install aria2p")
-            return 1
-
         try:
             downloader = HFDownloader(
-                args.lfs_url, args.hf_url, args.downloader
+                args.lfs_url, args.hf_url, args.hf_downloader, args.lfs_downloader
             )
         except Exception as e:
             print(f"❌ 初始化下载器失败: {e}")
