@@ -86,9 +86,9 @@ def _aria2_release_position(position):
         _aria2_active_positions.discard(position)
 
 
-def build_default_hf_headers():
+def build_default_hf_headers(token=None):
     return build_hf_headers(
-        token=True,
+        token=token,
         library_name=APP_NAME,
         library_version=APP_VERSION,
     )
@@ -131,9 +131,8 @@ class DownloaderInterface(ABC):
 
 class RequestsDownloader(DownloaderInterface):
     """基于 requests 库的下载器"""
-
-    def __init__(self):
-        self.default_headers = build_default_hf_headers()
+    def __init__(self, headers):
+        self.default_headers = headers
 
     def get_name(self):
         return "requests"
@@ -233,11 +232,11 @@ class RequestsDownloader(DownloaderInterface):
 class WgetDownloader(DownloaderInterface):
     """基于 wget 库的下载器"""
 
-    def __init__(self):
+    def __init__(self, headers):
         if not WGET_AVAILABLE:
             raise EnvironmentError("wget 库未安装，请运行: pip install wget")
 
-        self.default_headers = build_default_hf_headers()
+        self.default_headers = headers
         self.user_agent = self.default_headers.get("user-agent")
         if self.user_agent:
             try:
@@ -334,11 +333,11 @@ class WgetDownloader(DownloaderInterface):
 class PycurlDownloader(DownloaderInterface):
     """基于 pycurl 的下载器"""
 
-    def __init__(self):
+    def __init__(self, headers):
         if not PYCURL_AVAILABLE:
             raise EnvironmentError("pycurl 库未安装，请运行: pip install pycurl")
 
-        self.default_headers = build_default_hf_headers()
+        self.default_headers = headers
         self.connect_timeout = 30
         self.read_timeout = 300
 
@@ -499,7 +498,7 @@ class PycurlDownloader(DownloaderInterface):
 class Aria2Downloader(DownloaderInterface):
     """基于 aria2p 控制 aria2 RPC 的下载器"""
 
-    def __init__(self):
+    def __init__(self, headers):
         if not ARIA2P_AVAILABLE:
             raise EnvironmentError("aria2p 未安装，请运行: pip install aria2p")
 
@@ -521,7 +520,7 @@ class Aria2Downloader(DownloaderInterface):
         self.http_error_pattern = re.compile(
             r"status(?:\\scode)?[:=]\s*(\\d{3})", re.IGNORECASE
         )
-        self.default_headers = build_default_hf_headers()
+        self.default_headers = headers
 
         self.rpc_secret = secrets.token_hex(16)
         self.rpc_port = self._find_free_port()
@@ -791,12 +790,14 @@ class HFDownloader:
         self,
         lfs_base_url="https://xget.xi-xu.me/hf",
         hf_base_url="https://xget.xi-xu.me/hf",
-        hf_downloader_type="pycurl",
-        lfs_downloader_type="pycurl",
+        hf_downloader_type="requests",
+        lfs_downloader_type="requests",
+        token=None,
     ):
         self.lfs_base_url = lfs_base_url
         self.hf_base_url = hf_base_url
-        self.hf_api = HfApi(endpoint=hf_base_url)
+        self.hf_api = HfApi(endpoint=hf_base_url, token=token)
+        self.header = build_default_hf_headers(token=token)
 
         # LFS 文件大小阈值 (50MB)
         self.lfs_size_threshold = 50 * 1024 * 1024
@@ -807,25 +808,25 @@ class HFDownloader:
         # 选择下载器
         self.hf_downloader: DownloaderInterface | None = None
         if hf_downloader_type == "requests":
-            self.hf_downloader = RequestsDownloader()
+            self.hf_downloader = RequestsDownloader(self.header)
         elif hf_downloader_type == "wget":
-            self.hf_downloader = WgetDownloader()
+            self.hf_downloader = WgetDownloader(self.header)
         elif hf_downloader_type == "pycurl":
-            self.hf_downloader = PycurlDownloader()
+            self.hf_downloader = PycurlDownloader(self.header)
         elif lfs_downloader_type == "aria2":
-            self.lfs_downloader = Aria2Downloader()
+            self.lfs_downloader = Aria2Downloader(self.header)
         else:
             raise ValueError(f"不支持的下载器类型: {hf_downloader_type}")
 
         self.lfs_downloader: DownloaderInterface | None = None
         if lfs_downloader_type == "requests":
-            self.lfs_downloader = RequestsDownloader()
+            self.lfs_downloader = RequestsDownloader(self.header)
         elif lfs_downloader_type == "wget":
-            self.lfs_downloader = WgetDownloader()
+            self.lfs_downloader = WgetDownloader(self.header)
         elif lfs_downloader_type == "pycurl":
-            self.lfs_downloader = PycurlDownloader()
+            self.lfs_downloader = PycurlDownloader(self.header)
         elif lfs_downloader_type == "aria2":
-            self.lfs_downloader = Aria2Downloader()
+            self.lfs_downloader = Aria2Downloader(self.header)
         else:
             raise ValueError(f"不支持的下载器类型: {lfs_downloader_type}")
 
@@ -1383,6 +1384,11 @@ def main():
         help="HF 镜像URL，用于普通文件",
     )
     download_parser.add_argument(
+        "--token",
+        default=None,
+        help="Hugging Face 访问令牌 (可选)",
+    )
+    download_parser.add_argument(
         "--lfs-url",
         default="https://xget.xi-xu.me/hf",
         help="Xget 基础URL，用于 LFS 文件 (默认: https://xget.xi-xu.me/hf)",
@@ -1409,7 +1415,7 @@ def main():
     if args.command == "download":
         try:
             downloader = HFDownloader(
-                args.lfs_url, args.hf_url, args.hf_downloader, args.lfs_downloader
+                args.lfs_url, args.hf_url, args.hf_downloader, args.lfs_downloader, args.token
             )
         except Exception as e:
             print(f"❌ 初始化下载器失败: {e}")
