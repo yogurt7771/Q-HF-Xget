@@ -5,13 +5,7 @@ Xget Hugging Face 下载加速器
 """
 
 import argparse
-import atexit
-import re
-import secrets
-import shutil
 import signal
-import socket
-import subprocess
 import sys
 import threading
 import time
@@ -20,41 +14,14 @@ from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+
 import requests
 import urllib3
-from urllib.error import HTTPError, URLError
-
-try:
-    import aria2p
-
-    ARIA2P_AVAILABLE = True
-except ImportError:
-    aria2p = None
-    ARIA2P_AVAILABLE = False
-
-try:
-    import wget
-
-    WGET_AVAILABLE = True
-except ImportError:
-    wget = None
-    WGET_AVAILABLE = False
-
-try:
-    import pycurl
-
-    PYCURL_AVAILABLE = True
-except ImportError:
-    pycurl = None
-    PYCURL_AVAILABLE = False
-
 from huggingface_hub import HfApi
-from huggingface_hub._local_folder import (
-    read_download_metadata as hf_read_download_metadata,
-)
-from huggingface_hub._local_folder import (
-    write_download_metadata as hf_write_download_metadata,
-)
+from huggingface_hub._local_folder import \
+    read_download_metadata as hf_read_download_metadata
+from huggingface_hub._local_folder import \
+    write_download_metadata as hf_write_download_metadata
 from huggingface_hub.file_download import hf_hub_url
 from huggingface_hub.utils import build_hf_headers
 from huggingface_hub.utils.sha import git_hash, sha_fileobj
@@ -229,562 +196,6 @@ class RequestsDownloader(DownloaderInterface):
             return DownloadResult(success=False, message=str(e))
 
 
-class WgetDownloader(DownloaderInterface):
-    """基于 wget 库的下载器"""
-
-    def __init__(self, headers):
-        if not WGET_AVAILABLE:
-            raise EnvironmentError("wget 库未安装，请运行: pip install wget")
-
-        self.default_headers = headers
-        self.user_agent = self.default_headers.get("user-agent")
-        if self.user_agent:
-            try:
-                wget.user_agent = self.user_agent
-            except Exception:
-                pass
-
-    def get_name(self):
-        return "wget"
-
-    def download_file(self, url, local_path, resume=True):
-        local_path = Path(local_path)
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-
-        temp_path = local_path
-        if resume:
-            temp_path = local_path.with_suffix(local_path.suffix + ".incomplete")
-            if temp_path.exists():
-                print(f"⚠️ wget 下载器暂不支持断点续传，重新开始: {local_path.name}")
-                temp_path.unlink()
-        else:
-            if local_path.exists():
-                print(f"♻️  覆盖现有文件: {local_path.name}")
-                local_path.unlink()
-
-        progress_bar = None
-
-        def tqdm_bar(downloaded, total, width=80):
-            nonlocal progress_bar
-            if interrupted:
-                raise KeyboardInterrupt("interrupted")
-
-            total_value = total if total and total > 0 else None
-
-            if progress_bar is None:
-                initial = downloaded if total_value is not None else 0
-                progress_bar = tqdm(
-                    desc=local_path.name,
-                    total=total_value,
-                    initial=initial,
-                    unit="B",
-                    unit_scale=True,
-                    unit_divisor=1024,
-                    leave=False,
-                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
-                )
-            else:
-                if total_value is not None and progress_bar.total != total_value:
-                    progress_bar.total = total_value
-                delta = downloaded - progress_bar.n
-                if delta > 0:
-                    progress_bar.update(delta)
-            return ""
-
-        try:
-            result_path = wget.download(url, out=str(temp_path), bar=tqdm_bar)
-
-            if progress_bar is not None and progress_bar.total is not None:
-                remaining = progress_bar.total - progress_bar.n
-                if remaining > 0:
-                    progress_bar.update(remaining)
-
-            result_path = Path(result_path or temp_path)
-
-            if temp_path != local_path:
-                local_path.unlink(missing_ok=True)
-                result_path.replace(local_path)
-
-            return DownloadResult(success=True)
-
-        except HTTPError as e:
-            print(f"🚫 HTTP {e.code}: {local_path.name}")
-            temp_path.unlink(missing_ok=True)
-            return DownloadResult(success=False, status_code=getattr(e, 'code', None), message=str(e))
-        except URLError as e:
-            print(f"❌ 下载失败: {local_path.name}")
-            print(f"原因: {e.reason if hasattr(e, 'reason') else e}")
-            temp_path.unlink(missing_ok=True)
-            return DownloadResult(success=False, message=str(e))
-        except KeyboardInterrupt:
-            temp_path.unlink(missing_ok=True)
-            return DownloadResult(success=False, message="interrupted")
-        except Exception as e:
-            if not interrupted:
-                print(f"❌ 下载失败: {local_path.name}")
-                print(f"原因: {str(e)}")
-            temp_path.unlink(missing_ok=True)
-            return DownloadResult(success=False, message=str(e))
-        finally:
-            if progress_bar is not None:
-                progress_bar.close()
-
-
-class PycurlDownloader(DownloaderInterface):
-    """基于 pycurl 的下载器"""
-
-    def __init__(self, headers):
-        if not PYCURL_AVAILABLE:
-            raise EnvironmentError("pycurl 库未安装，请运行: pip install pycurl")
-
-        self.default_headers = headers
-        self.connect_timeout = 30
-        self.read_timeout = 300
-
-    def get_name(self):
-        return "pycurl"
-
-    def download_file(self, url, local_path, resume=True):
-        local_path = Path(local_path)
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-
-        temp_path = local_path
-        initial_pos = 0
-
-        if resume:
-            temp_path = local_path.with_suffix(local_path.suffix + ".incomplete")
-            if temp_path.exists():
-                initial_pos = temp_path.stat().st_size
-        else:
-            if local_path.exists():
-                print(f"♻️  覆盖现有文件: {local_path.name}")
-                local_path.unlink()
-
-        file_mode = "ab" if initial_pos > 0 else "wb"
-        progress_bar = None
-        curl = None
-        file_obj = None
-        should_remove_partial = False
-
-        def progress_callback(download_total, download_now, upload_total, upload_now):
-            nonlocal progress_bar
-            if interrupted:
-                return 1
-
-            total_value = download_total + initial_pos if download_total and download_total > 0 else None
-            current = download_now + initial_pos
-
-            if progress_bar is None:
-                progress_bar_local_total = total_value
-                progress_bar = tqdm(
-                    desc=local_path.name,
-                    total=progress_bar_local_total,
-                    initial=initial_pos,
-                    unit="B",
-                    unit_scale=True,
-                    unit_divisor=1024,
-                    leave=False,
-                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
-                )
-            else:
-                if total_value is not None and progress_bar.total != total_value:
-                    progress_bar.total = total_value
-
-            if progress_bar.total is not None and current > progress_bar.total:
-                current = progress_bar.total
-
-            delta = current - progress_bar.n
-            if delta < 0:
-                progress_bar.reset(total=progress_bar.total)
-                progress_bar.update(current)
-            elif delta > 0:
-                progress_bar.update(delta)
-
-            return 0
-
-        try:
-            file_obj = open(temp_path, file_mode)
-
-            curl = pycurl.Curl()
-            curl.setopt(pycurl.URL, url)
-            curl.setopt(pycurl.FOLLOWLOCATION, True)
-            curl.setopt(pycurl.MAXREDIRS, 5)
-            curl.setopt(pycurl.NOSIGNAL, True)
-            curl.setopt(pycurl.CONNECTTIMEOUT, self.connect_timeout)
-            curl.setopt(pycurl.TIMEOUT, self.read_timeout)
-            curl.setopt(pycurl.WRITEDATA, file_obj)
-            curl.setopt(pycurl.NOPROGRESS, False)
-
-            headers = []
-            user_agent = None
-            for key, value in self.default_headers.items():
-                if key.lower() == "user-agent":
-                    user_agent = value
-                else:
-                    headers.append(f"{key}: {value}")
-
-            if headers:
-                curl.setopt(pycurl.HTTPHEADER, headers)
-            if user_agent:
-                curl.setopt(pycurl.USERAGENT, user_agent)
-
-            if resume and initial_pos > 0:
-                curl.setopt(pycurl.RESUME_FROM, initial_pos)
-                file_obj.seek(initial_pos)
-            else:
-                file_obj.seek(0)
-
-            if hasattr(pycurl, "XFERINFOFUNCTION"):
-                curl.setopt(pycurl.XFERINFOFUNCTION, progress_callback)
-            else:
-                curl.setopt(pycurl.PROGRESSFUNCTION, progress_callback)
-
-            curl.perform()
-
-            status_code = int(curl.getinfo(pycurl.RESPONSE_CODE) or 0)
-            if status_code >= 400:
-                print(f"🚫 HTTP {status_code}: {local_path.name}")
-                should_remove_partial = True
-                return DownloadResult(success=False, status_code=status_code, message=f"HTTP {status_code}")
-
-            if progress_bar is not None and progress_bar.total is not None:
-                remaining = progress_bar.total - progress_bar.n
-                if remaining > 0:
-                    progress_bar.update(remaining)
-
-            if temp_path != local_path:
-                file_obj.flush()
-                file_obj.close()
-                file_obj = None
-                local_path.unlink(missing_ok=True)
-                temp_path.rename(local_path)
-
-            return DownloadResult(success=True)
-
-        except pycurl.error as e:
-            errno = e.args[0] if e.args else None
-            status_code = None
-            if curl is not None:
-                try:
-                    status_code = int(curl.getinfo(pycurl.RESPONSE_CODE) or 0)
-                except Exception:
-                    status_code = None
-            if errno == getattr(pycurl, "E_ABORTED_BY_CALLBACK", 42) or interrupted:
-                should_remove_partial = True
-                return DownloadResult(success=False, message="interrupted")
-            print(f"❌ 下载失败: {local_path.name}")
-            print(f"原因: {e.args[1] if len(e.args) > 1 else e}")
-            should_remove_partial = True
-            return DownloadResult(success=False, status_code=status_code, message=str(e))
-        except KeyboardInterrupt:
-            should_remove_partial = True
-            return DownloadResult(success=False, message="interrupted")
-        except Exception as e:
-            print(f"❌ 下载失败: {local_path.name}")
-            print(f"原因: {str(e)}")
-            should_remove_partial = True
-            return DownloadResult(success=False, message=str(e))
-        finally:
-            if file_obj is not None:
-                file_obj.close()
-            if curl is not None:
-                curl.close()
-            if progress_bar is not None:
-                progress_bar.close()
-            if should_remove_partial:
-                temp_path.unlink(missing_ok=True)
-
-
-class Aria2Downloader(DownloaderInterface):
-    """基于 aria2p 控制 aria2 RPC 的下载器"""
-
-    def __init__(self, headers):
-        if not ARIA2P_AVAILABLE:
-            raise EnvironmentError("aria2p 未安装，请运行: pip install aria2p")
-
-        self.aria2_path = shutil.which("aria2c")
-
-        if not self.aria2_path and sys.platform == "win32":
-            local_candidate = Path(__file__).with_name("aria2c.exe")
-            if local_candidate.exists():
-                self.aria2_path = str(local_candidate)
-
-        if not self.aria2_path and sys.platform != "win32":
-            local_candidate = Path(__file__).with_name("aria2c")
-            if local_candidate.exists():
-                self.aria2_path = str(local_candidate)
-
-        if not self.aria2_path:
-            raise EnvironmentError("未检测到 aria2c，请先安装 aria2 下载器")
-
-        self.http_error_pattern = re.compile(
-            r"status(?:\\scode)?[:=]\s*(\\d{3})", re.IGNORECASE
-        )
-        self.default_headers = headers
-
-        self.rpc_secret = secrets.token_hex(16)
-        self.rpc_port = self._find_free_port()
-        self._aria2_process = self._start_daemon()
-
-        self._client = aria2p.Client(
-            host="http://127.0.0.1", port=self.rpc_port, secret=self.rpc_secret
-        )
-        self._api = aria2p.API(self._client)
-        self._api_lock = threading.Lock()
-        self._ensure_daemon_ready()
-        atexit.register(self.shutdown)
-
-    def get_name(self):
-        return "aria2"
-
-    @staticmethod
-    def _format_speed(speed):
-        if not speed or speed <= 0:
-            return "0B/s"
-        units = ["B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s"]
-        value = float(speed)
-        for unit in units:
-            if value < 1024 or unit == units[-1]:
-                return f"{value:.1f}{unit}"
-            value /= 1024
-        return f"{value:.1f}PiB/s"
-
-    @staticmethod
-    def _format_eta(total, completed, speed):
-        if not speed or speed <= 0:
-            return "--"
-        remaining = max(total - completed, 0)
-        seconds = int(remaining / speed) if speed else 0
-        if seconds < 0:
-            seconds = 0
-        try:
-            return tqdm.format_interval(seconds)
-        except AttributeError:
-            from tqdm.utils import format_interval
-
-            return format_interval(seconds)
-
-    def _parse_http_status(self, message):
-        if not message:
-            return None
-        match = self.http_error_pattern.search(message)
-        if match:
-            return int(match.group(1))
-        return None
-
-    def _find_free_port(self):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind(("127.0.0.1", 0))
-            return sock.getsockname()[1]
-
-    def _start_daemon(self):
-        args = [
-            self.aria2_path,
-            "--enable-rpc=true",
-            "--rpc-listen-all=false",
-            f"--rpc-listen-port={self.rpc_port}",
-            f"--rpc-secret={self.rpc_secret}",
-            "--rpc-allow-origin-all=true",
-            "--max-connection-per-server=4",
-            "--min-split-size=1M",
-            "--continue=true",
-            "--max-tries=5",
-            "--retry-wait=10",
-            "--auto-file-renaming=false",
-            "--console-log-level=warn",
-        ]
-        try:
-            return subprocess.Popen(
-                args,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except OSError as exc:
-            raise EnvironmentError(f"启动 aria2c 失败: {exc}") from exc
-
-    def _ensure_daemon_ready(self, timeout=10.0):
-        start = time.time()
-        last_error = None
-        while time.time() - start < timeout:
-            if self._aria2_process.poll() is not None:
-                raise EnvironmentError("aria2c 进程提前退出，请检查安装和配置")
-            try:
-                with self._api_lock:
-                    self._client.get_version()
-                return
-            except Exception as exc:
-                last_error = exc
-                time.sleep(0.2)
-        raise EnvironmentError(f"aria2c RPC 未就绪: {last_error}")
-
-    def shutdown(self):
-        process = getattr(self, "_aria2_process", None)
-        if not process:
-            return
-        if process.poll() is None:
-            try:
-                with self._api_lock:
-                    try:
-                        downloads = self._api.get_downloads()
-                        for download in downloads:
-                            if download.status in ("active", "waiting", "paused"):
-                                self._api.remove(download, force=True, files=False)
-                    except Exception:
-                        pass
-                    try:
-                        self._api.force_shutdown()
-                    except Exception:
-                        self._api.shutdown()
-            except Exception:
-                pass
-            try:
-                process.terminate()
-            except Exception:
-                pass
-            try:
-                process.wait(timeout=3)
-            except Exception:
-                try:
-                    process.kill()
-                except Exception:
-                    pass
-        self._aria2_process = None
-
-    def download_file(self, url, local_path, resume=True):
-        local_path = Path(local_path)
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-
-        control_file = Path(str(local_path) + ".aria2")
-        fresh_download = not resume or (
-            local_path.exists() and not control_file.exists()
-        )
-
-        if fresh_download and local_path.exists():
-            tqdm.write(f"♻️  覆盖现有文件: {local_path.name}")
-            try:
-                local_path.unlink()
-            except OSError as exc:
-                tqdm.write(f"⚠️  无法删除旧文件 {local_path.name}: {exc}")
-                return DownloadResult(success=False, message=str(exc))
-
-        if fresh_download and control_file.exists():
-            try:
-                control_file.unlink()
-            except OSError:
-                pass
-
-        if self._aria2_process.poll() is not None:
-            raise EnvironmentError("aria2c 进程不可用，请重试或检查安装")
-
-        headers = [f"{key}: {value}" for key, value in self.default_headers.items()]
-        options = {
-            "dir": str(local_path.parent),
-            "out": local_path.name,
-            "continue": "true",
-            "allow-overwrite": "true" if fresh_download else "false",
-            "auto-file-renaming": "false",
-            "max-connection-per-server": "8",
-            "min-split-size": "1M",
-            "max-tries": "5",
-            "retry-wait": "10",
-            "header": headers,
-        }
-
-        user_agent = self.default_headers.get("user-agent")
-        if user_agent:
-            options["user-agent"] = user_agent
-
-        position = _aria2_acquire_position()
-        progress_bar = tqdm(
-            total=1,
-            desc=local_path.name,
-            unit="B",
-            unit_scale=True,
-            unit_divisor=1024,
-            leave=False,
-            position=position,
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
-        )
-
-        download = None
-        try:
-            try:
-                with self._api_lock:
-                    download = self._api.add_uris([url], options=options)
-            except Exception as exc:
-                tqdm.write(f"❌ 启动 aria2 任务失败: {local_path.name} | {exc}")
-                return DownloadResult(success=False, message=str(exc))
-
-            while True:
-                if interrupted:
-                    try:
-                        with self._api_lock:
-                            if download is not None:
-                                self._api.pause(download.gid)
-                    except Exception:
-                        pass
-                    tqdm.write(f"⏹️  手动中断 aria2 任务: {local_path.name}")
-                    return DownloadResult(success=False, message="interrupted")
-
-                try:
-                    with self._api_lock:
-                        current_download = self._api.get_download(download.gid)
-                except Exception as exc:
-                    tqdm.write(f"❌ 无法获取 aria2 状态: {local_path.name} | {exc}")
-                    return DownloadResult(success=False, message=str(exc))
-
-                total = int(current_download.total_length or 0)
-                completed = int(current_download.completed_length or 0)
-                speed = int(current_download.download_speed or 0)
-                connections = current_download.connections or 0
-
-                if total > 0 and progress_bar.total != total:
-                    progress_bar.total = total
-
-                delta = completed - progress_bar.n
-                if delta < 0:
-                    progress_bar.reset(total=progress_bar.total)
-                    progress_bar.update(completed)
-                elif delta:
-                    progress_bar.update(delta)
-
-                eta_str = self._format_eta(total, completed, speed)
-                progress_bar.set_postfix_str(
-                    f"CN:{connections} DL:{self._format_speed(speed)} ETA:{eta_str}"
-                )
-                progress_bar.refresh()
-
-                status = current_download.status
-                if status == "complete":
-                    return DownloadResult(success=True)
-                if status == "error":
-                    status_code = self._parse_http_status(
-                        current_download.error_message
-                    )
-                    message = (
-                        current_download.error_message
-                        or f"aria2 错误码 {current_download.error_code}"
-                    )
-                    tqdm.write(f"❌ aria2 下载失败: {local_path.name} | {message}")
-                    return DownloadResult(
-                        success=False, status_code=status_code, message=message
-                    )
-                if status == "removed":
-                    tqdm.write(f"❌ aria2 任务被移除: {local_path.name}")
-                    return DownloadResult(success=False, message="removed")
-
-                time.sleep(0.3)
-        finally:
-            progress_bar.close()
-            _aria2_release_position(position)
-            if download is not None:
-                try:
-                    with self._api_lock:
-                        self._api.remove_download_result(download)
-                except Exception:
-                    pass
-
-
 class HFDownloader:
     def __init__(
         self,
@@ -802,31 +213,16 @@ class HFDownloader:
         # LFS 文件大小阈值 (50MB)
         self.lfs_size_threshold = 50 * 1024 * 1024
 
-        # 缓存当前解析到的提交哈希，供写入元数据使用
-        self.resolved_commit_hash = None
-
         # 选择下载器
         self.hf_downloader: DownloaderInterface | None = None
         if hf_downloader_type == "requests":
             self.hf_downloader = RequestsDownloader(self.header)
-        elif hf_downloader_type == "wget":
-            self.hf_downloader = WgetDownloader(self.header)
-        elif hf_downloader_type == "pycurl":
-            self.hf_downloader = PycurlDownloader(self.header)
-        elif lfs_downloader_type == "aria2":
-            self.lfs_downloader = Aria2Downloader(self.header)
         else:
             raise ValueError(f"不支持的下载器类型: {hf_downloader_type}")
 
         self.lfs_downloader: DownloaderInterface | None = None
         if lfs_downloader_type == "requests":
             self.lfs_downloader = RequestsDownloader(self.header)
-        elif lfs_downloader_type == "wget":
-            self.lfs_downloader = WgetDownloader(self.header)
-        elif lfs_downloader_type == "pycurl":
-            self.lfs_downloader = PycurlDownloader(self.header)
-        elif lfs_downloader_type == "aria2":
-            self.lfs_downloader = Aria2Downloader(self.header)
         else:
             raise ValueError(f"不支持的下载器类型: {lfs_downloader_type}")
 
@@ -843,12 +239,9 @@ class HFDownloader:
             repo_info = self.hf_api.repo_info(
                 repo_id, repo_type=repo_type, revision=revision, files_metadata=True
             )
-
-            self.resolved_commit_hash = (
-                getattr(repo_info, "sha", None)
-                or getattr(repo_info, "commit", None)
-                or getattr(repo_info, "commit_hash", None)
-            )
+            
+            self.commit_hash = repo_info.sha
+            print(f"🔖 提交哈希: {self.commit_hash}")
 
             files_info = []
             for sibling in repo_info.siblings:
@@ -981,16 +374,6 @@ class HFDownloader:
             )
             return False
 
-        if (
-            self.resolved_commit_hash
-            and metadata.commit_hash
-            and metadata.commit_hash != self.resolved_commit_hash
-        ):
-            print(
-                f"❌ 提交哈希不匹配: {file_path.name} | 当前 {self.resolved_commit_hash}, 元数据 {metadata.commit_hash}"
-            )
-            return False
-
         return True
 
     def _write_local_metadata(self, local_dir, file_info):
@@ -1006,7 +389,7 @@ class HFDownloader:
 
         try:
             hf_write_download_metadata(
-                Path(local_dir), filename, self.resolved_commit_hash, etag
+                Path(local_dir), filename, self.commit_hash, etag
             )
         except Exception as e:
             print(f"⚠️  写入元数据失败 {file_info['filename']}: {e}")
@@ -1395,13 +778,13 @@ def main():
     )
     download_parser.add_argument(
         "--hf-downloader",
-        choices=["requests", "aria2", "wget", "pycurl"],
+        choices=["requests"],
         default="requests",
         help="下载核心",
     )
     download_parser.add_argument(
         "--lfs-downloader",
-        choices=["requests", "aria2", "wget", "pycurl"],
+        choices=["requests"],
         default="requests",
         help="下载核心",
     )
