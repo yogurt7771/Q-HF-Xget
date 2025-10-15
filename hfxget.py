@@ -5,6 +5,7 @@ Xget Hugging Face 下载加速器
 """
 
 import argparse
+import re
 import signal
 import sys
 import threading
@@ -37,6 +38,8 @@ APP_VERSION = "1.0"
 # 统一管理 aria2 tqdm 的显示位置，避免多线程冲突
 _aria2_position_lock = threading.Lock()
 _aria2_active_positions = set()
+
+_CONTENT_RANGE_RE = re.compile(r"bytes (\d+)-(\d+)/(\d+|\*)")
 
 
 def _aria2_acquire_position():
@@ -124,35 +127,82 @@ class RequestsDownloader(DownloaderInterface):
         headers = session.headers.copy()
         mode = "wb"
         initial_pos = 0
+        attempting_resume = False
 
         if resume and temp_path.exists() and temp_path != local_path:
             initial_pos = temp_path.stat().st_size
-            headers["Range"] = f"bytes={initial_pos}-"
-            mode = "ab"
-            print(
-                f"断点续传: {local_path.name} (从 {initial_pos / (1024*1024):.1f} MB 开始)"
-            )
+            if initial_pos > 0:
+                headers["Range"] = f"bytes={initial_pos}-"
+                mode = "ab"
+                attempting_resume = True
+                print(
+                    f"断点续传: {local_path.name} (从 {initial_pos / (1024*1024):.1f} MB 开始)"
+                )
+            else:
+                temp_path.unlink(missing_ok=True)
 
         try:
-            response = session.get(
-                url,
-                headers=headers,
-                stream=True,
-                timeout=(30, 60),
-                verify=True,
-                allow_redirects=True,
-            )
+            response = None
+            while True:
+                response = session.get(
+                    url,
+                    headers=headers,
+                    stream=True,
+                    timeout=(30, 60),
+                    verify=True,
+                    allow_redirects=True,
+                )
 
-            if response.status_code == 416:
-                if temp_path.exists() and temp_path != local_path:
-                    local_path.unlink(missing_ok=True)
-                    temp_path.rename(local_path)
-                    print(f"✅ 本地已完整，重命名: {local_path.name}")
+                if not attempting_resume:
+                    break
+
+                if response.status_code == 416:
+                    if temp_path.exists() and temp_path != local_path:
+                        local_path.unlink(missing_ok=True)
+                        temp_path.rename(local_path)
+                        print(f"✅ 本地已完整，重命名: {local_path.name}")
+                        return DownloadResult(success=True)
                     return DownloadResult(success=True)
-                return DownloadResult(success=True)
+
+                if response.status_code != 206:
+                    response.close()
+                    headers = session.headers.copy()
+                    mode = "wb"
+                    initial_pos = 0
+                    attempting_resume = False
+                    temp_path.unlink(missing_ok=True)
+                    print(f"⚠️  服务器不支持 Range，重新下载: {local_path.name}")
+                    continue
+
+                content_range = response.headers.get("content-range")
+                if not content_range:
+                    response.close()
+                    headers = session.headers.copy()
+                    mode = "wb"
+                    initial_pos = 0
+                    attempting_resume = False
+                    temp_path.unlink(missing_ok=True)
+                    print(f"⚠️  Range 响应缺少 Content-Range，重新下载: {local_path.name}")
+                    continue
+
+                match = _CONTENT_RANGE_RE.match(content_range)
+                if not match or int(match.group(1)) != initial_pos:
+                    response.close()
+                    headers = session.headers.copy()
+                    mode = "wb"
+                    initial_pos = 0
+                    attempting_resume = False
+                    temp_path.unlink(missing_ok=True)
+                    print(f"⚠️  Range 偏移不匹配，重新下载: {local_path.name}")
+                    continue
+
+                break
 
             response.raise_for_status()
-            total_size = int(response.headers.get("content-length", 0)) + initial_pos
+            try:
+                total_size = int(response.headers.get("content-length", 0)) + initial_pos
+            except (TypeError, ValueError):
+                total_size = None
 
             with open(temp_path, mode) as f:
                 with tqdm(
